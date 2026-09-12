@@ -1,0 +1,87 @@
+# dsh-windows-remote-ssh bundle patch: mount the remote desktop-control
+# plugin. Every key below is a Config field (Schemastery schema); invalid
+# values fail the profile load loudly. See README.md "Configuration" for the
+# full table.
+#
+# SSH connection fields may be omitted here and supplied instead through
+# SSH_HOST / SSH_PORT / SSH_USER / SSH_PASSWORD / SSH_KEY_PATH /
+# SSH_KEY_PASSPHRASE environment variables — handy for CI and for keeping
+# credentials out of a checked-in profile.
+- insert:
+    - id: dsh-windows-remote-ssh
+      name: dsh-windows-remote-ssh
+      config:
+        ssh:
+          # Target host. Falls back to env SSH_HOST when omitted.
+          host: null
+          # Falls back to env SSH_PORT, then 22.
+          port: 22
+          # Falls back to env SSH_USER.
+          user: null
+          # Password auth; falls back to env SSH_PASSWORD. Prefer a key below
+          # when the target supports it.
+          password: null
+          # Private key file path; falls back to env SSH_KEY_PATH. Takes
+          # priority over password when both resolve.
+          privateKeyPath: null
+          # Passphrase for an encrypted private key; falls back to env
+          # SSH_KEY_PASSPHRASE.
+          passphrase: null
+          # Reject unknown/changed host keys (default true). Set false only
+          # for disposable lab/test targets — never for a real deployment.
+          strictHostKeyChecking: true
+          # Remote directory name (created under the connected user's %TEMP%)
+          # the helper script and per-call request/response files live under.
+          # Kept short on purpose: it rides inside a Scheduled Task command
+          # line that has a 261-character limit.
+          remoteWorkdir: dsh-rssh
+        # Gate every mutating action (click/type/scroll/key/app_launch) behind
+        # approval. Observers (screen_shot/screen_read/app_list) never ask.
+        requireApproval: true
+        # Window title or executable-path regexes that skip the approval ask.
+        # The action still runs through the freshness and process-identity
+        # checks and is audit-logged. Empty = ask for every action.
+        autoApproveWindows: []
+        # Append dsh-windows-remote-ssh session audit events
+        # (observed/action) to the session log.
+        auditSessionEvents: true
+        # Whether a mutating action may bring the target window to the
+        # foreground as a fallback when posted input is unavailable.
+        # 'never' (default) never steals focus; 'allow' permits the fallback.
+        focusFallback: never
+        # How screen_shot renders: 'auto' (default) always attaches the
+        # captured image as an attachment (the harness's own pipeline adapts
+        # it to whatever the current model accepts); 'text' always sends only
+        # the text description instead, for a deployment that never wants
+        # image bytes leaving the plugin.
+        imageMode: auto
+        # SSH handshake timeout in milliseconds (1..120000).
+        connectTimeoutMs: 20000
+        # Per-helper-call timeout in milliseconds (1..300000), on top of the
+        # SSH round trip.
+        helperTimeoutMs: 30000
+        # Longest side of a captured screenshot in pixels (320..7680); larger
+        # captures are downscaled before they cross the SSH link.
+        maxScreenshotSide: 1600
+        # Compare a fresh pixel hash of the target window before every action
+        # and refuse when it differs from the cited observation (the
+        # stale-state boundary). Disable only for tooling that mutates the
+        # remote screen faster than the check can run.
+        staleCheckPixels: true
+        # Maximum age in ms of an observation that an action may still base
+        # on (1000..600000). Older observations are refused and must be
+        # re-observed.
+        maxObservationAgeMs: 30000
+        # Cap on cached observations (1..64), LRU-evicted. Actions address
+        # observations by the id returned from screen_shot/screen_read.
+        maxCachedObservations: 8
+        # Cap on accessibility elements one screen_read returns (1..2000).
+        maxElements: 500
+        # Maximum depth of the accessibility tree walk (1..64).
+        maxTreeDepth: 32
+        # Truncation length for sanitized model-visible strings (16..10000):
+        # window titles, executable paths, element names.
+        maxTextLength: 200
+        # Back up and restore control text when `type` fails (true = restore
+        # the original text; false = leave the partially typed text).
+        rollbackEnabled: true
