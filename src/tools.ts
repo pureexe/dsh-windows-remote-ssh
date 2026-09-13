@@ -174,11 +174,14 @@ function shotDescription(window: ObservedWindowValue, width: number, height: num
 }
 
 /**
- * Resolve `screen_shot`'s `maxSide`: `configuredDefault` (`config.maxScreenshotSide`)
- * applies only when the call omits `maxSide` - it is a default, not a
- * ceiling, so an explicit request is honored even above it, bounded only by
- * the absolute `MIN_SCREENSHOT_SIDE`/`MAX_SCREENSHOT_SIDE` range (the model
- * may deliberately ask for a higher resolution, e.g. to read small text).
+ * Resolve `screen_shot`'s `maxSide` - the longer of the captured image's
+ * width/height (whichever that is depends on the target's aspect ratio; a
+ * wide window's width is capped, a tall one's height is). `configuredDefault`
+ * (`config.maxScreenshotSide`) applies only when the call omits `maxSide` -
+ * it is a default, not a ceiling, so an explicit request is honored even
+ * above it, bounded only by the absolute `MIN_SCREENSHOT_SIDE`/
+ * `MAX_SCREENSHOT_SIDE` range (the model may deliberately ask for a higher
+ * resolution, e.g. to read small text).
  */
 export function resolveScreenshotMaxSide(requested: number | undefined, configuredDefault: number): number {
   if (requested === undefined) return configuredDefault
@@ -231,7 +234,7 @@ export function screenShotTool(services: ToolServices) {
       },
       maxSide: {
         type: 'integer',
-        description: `Longest side in pixels (${MIN_SCREENSHOT_SIDE}-${MAX_SCREENSHOT_SIDE}); larger captures are downscaled. Defaults to maxScreenshotSide; explicit values honored above it up to the ceiling.`,
+        description: `Cap in pixels (${MIN_SCREENSHOT_SIDE}-${MAX_SCREENSHOT_SIDE}) on the longer of width/height - whichever one that is for this capture; larger captures are downscaled. Defaults to maxScreenshotSide; explicit values honored above it up to the ceiling.`,
       },
     },
     output: {

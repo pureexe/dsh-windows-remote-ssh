@@ -67,8 +67,10 @@
         # Per-helper-call timeout in milliseconds (1..300000), on top of the
         # SSH round trip.
         helperTimeoutMs: 30000
-        # Longest side of a captured screenshot in pixels (320..7680); larger
-        # captures are downscaled before they cross the SSH link.
+        # Cap in pixels (320..7680) on the longer of a captured screenshot's
+        # width/height - whichever one that is for a given window's aspect
+        # ratio; larger captures are downscaled before they cross the SSH
+        # link.
         maxScreenshotSide: 1600
         # Compare the whole window's accessibility tree before every action
         # and refuse if ANYTHING in it differs from the cited observation -

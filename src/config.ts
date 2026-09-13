@@ -162,7 +162,7 @@ export interface Config {
   connectTimeoutMs?: number
   /** Per-helper-call timeout in milliseconds (default 30000). */
   helperTimeoutMs?: number
-  /** Longest side of a captured screenshot in pixels (default 1600). */
+  /** Cap in pixels on the longer of a captured screenshot's width/height, whichever that is for the given capture (default 1600). */
   maxScreenshotSide?: number
   /**
    * Compare the accessibility tree of the whole window before every action
