@@ -109,11 +109,15 @@ export interface Config {
    * Compare the accessibility tree of the whole window before every action
    * and refuse if anything in it differs from the cited observation — not
    * just the targeted element (default true; the stale-state boundary).
-   * Disable for a target whose window has any live-updating content
-   * elsewhere (a clock, a status indicator, a tooltip, scrollbar position)
-   * that would otherwise trip this on every action even though the element
-   * you're addressing hasn't changed. Identity (window/pid/exe/title/class/
-   * rect) and the observation-age check still apply regardless.
+   * Already skipped automatically for `type` and for `click`/`scroll` when
+   * addressed by `elementId` — those re-resolve that exact element by its
+   * UIA RuntimeId immediately before acting and fail loudly if it's gone, so
+   * the whole-tree hash adds no real safety there. Still applies to
+   * coordinate-based `click` and to `key`, neither of which has anything
+   * else re-verifying the target; disable this only if even those trip too
+   * often for a fast-changing target window. Identity
+   * (window/pid/exe/title/class/rect) and the observation-age check still
+   * apply regardless.
    */
   staleCheckTree?: boolean
   /** Compare a fresh pixel hash before every action (default true; the stale-state boundary). */

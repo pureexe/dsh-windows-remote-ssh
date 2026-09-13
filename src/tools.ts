@@ -575,7 +575,12 @@ export function clickTool(services: ToolServices) {
           windowId: parsed.basedOn.windowId,
           ...byElement ? { elementId: target.elementId as string } : { x: target.x as number, y: target.y as number },
           button: parsed.button ?? 'left',
-        }, focusFallback, exec.signal))
+        }, focusFallback, exec.signal),
+        // By elementId: the helper re-resolves that exact element by its UIA
+        // RuntimeId right before clicking and fails loudly if it's gone, so
+        // the whole-window tree hash adds no safety here. By coordinate,
+        // nothing else re-verifies what's actually at (x, y), so keep it.
+        !byElement)
       return {
         ok: true,
         windowId: outcome.windowId,
@@ -621,7 +626,12 @@ export function typeTool(services: ToolServices) {
           elementId: parsed.elementId,
           text: parsed.text,
           rollback: config.rollbackEnabled,
-        }, focusFallback, exec.signal))
+        }, focusFallback, exec.signal),
+        // elementId is mandatory here: the helper always re-resolves it by
+        // UIA RuntimeId right before typing and fails loudly if it's gone,
+        // so the whole-window tree hash adds no safety and only
+        // false-positives on unrelated content elsewhere in the window.
+        false)
       return {
         ok: true,
         windowId: outcome.windowId,
@@ -669,7 +679,12 @@ export function scrollTool(services: ToolServices) {
           ...parsed.elementId !== undefined ? { elementId: parsed.elementId } : {},
           direction: parsed.direction,
           amount,
-        }, focusFallback, exec.signal))
+        }, focusFallback, exec.signal),
+        // By elementId: the helper re-resolves it by UIA RuntimeId before
+        // deciding how to scroll and fails loudly if it's gone, so the
+        // whole-window tree hash adds no safety here. Scrolling the window
+        // itself (no elementId) has no such per-target re-check, so keep it.
+        parsed.elementId === undefined)
       return {
         ok: true,
         windowId: outcome.windowId,

@@ -67,7 +67,7 @@ export class ActionExecutor {
    * The staleness boundary: resolve the cited observation, re-observe the
    * remote window right now, and compare.
    */
-  private async requireFreshWindow(observationId: string, windowId: number, signal: AbortSignal): Promise<{ record: ObservationRecord; fresh: WindowSnapshot }> {
+  private async requireFreshWindow(observationId: string, windowId: number, signal: AbortSignal, checkTree: boolean): Promise<{ record: ObservationRecord; fresh: WindowSnapshot }> {
     const record = this.deps.observations.get(observationId)
     if (record === undefined) {
       throw new RemoteSshError(
@@ -82,7 +82,7 @@ export class ActionExecutor {
       )
     }
     const fresh = await this.deps.getBackend(record.target).snapshot(windowId, signal)
-    const verdict = this.deps.observations.verify(record, fresh)
+    const verdict = this.deps.observations.verify(record, fresh, undefined, checkTree)
     if (!verdict.ok) {
       throw new RemoteSshError(
         `${verdict.detail} — run screen_read or screen_shot again before acting`,
@@ -164,6 +164,13 @@ export class ActionExecutor {
    * backend already resolved from the cited observation's own target — never
    * whatever target this call happens to be associated with — so an action
    * always replays against the exact host it was observed on.
+   *
+   * @param checkTree - whether the whole-window tree-hash freshness check
+   * applies to this call (default true). Pass `false` when the action
+   * addresses a specific `elementId`: the helper re-resolves that exact
+   * element by its UIA RuntimeId immediately before acting and fails loudly
+   * if it's gone, so the coarser tree hash adds no safety there and only
+   * false-positives on unrelated live content elsewhere in the window.
    */
   async perform(
     toolName: string,
@@ -171,12 +178,13 @@ export class ActionExecutor {
     observationId: string,
     windowId: number,
     run: (focusFallback: boolean, backend: DesktopBackend) => Promise<ActionOutcome>,
+    checkTree = true,
   ): Promise<ActionOutcome> {
     let approved: ApprovalKind = 'none'
     let observationIdAudited: string | undefined
     let windowIdAudited: number | undefined
     try {
-      const { record } = await this.requireFreshWindow(observationId, windowId, exec.signal)
+      const { record } = await this.requireFreshWindow(observationId, windowId, exec.signal, checkTree)
       observationIdAudited = observationId
       windowIdAudited = windowId
       approved = await this.gate(exec, toolName, {

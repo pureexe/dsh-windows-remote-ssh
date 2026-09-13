@@ -66,10 +66,12 @@
         # Compare the whole window's accessibility tree before every action
         # and refuse if ANYTHING in it differs from the cited observation -
         # not just the element being addressed (the stale-state boundary).
-        # Set false if the target window has any live-updating content
-        # elsewhere (a clock, a status indicator, a tooltip, scrollbar
-        # position) that would otherwise trip this on every action even
-        # though the addressed element itself hasn't changed. Identity
+        # Already skipped automatically for `type` and for `click`/`scroll`
+        # by elementId - those re-resolve that exact element by its UIA
+        # RuntimeId right before acting and fail loudly if it's gone, so the
+        # whole-tree hash adds no safety there. Still applies to
+        # coordinate-based `click` and to `key`. Set false only if even
+        # those trip too often for a fast-changing target window. Identity
         # (window/pid/exe/title/class/rect) and the observation-age check
         # still apply regardless.
         staleCheckTree: true

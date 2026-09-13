@@ -156,12 +156,18 @@ model can't act on a screen it no longer has an accurate picture of. It also
 captures the target process's identity before and after the action and
 refuses if it changed mid-flight.
 
-`staleCheckTree` compares the *whole* window's tree, not just the element
-being addressed — any live-updating content elsewhere in that window (a
-clock, a status indicator, a tooltip, scrollbar position) will trip it on
-every action even though the element you're addressing never changed. Set
-it `false` for a target with content like that; identity and the
-observation-age check still apply regardless.
+`staleCheckTree` (default `true`) compares the *whole* window's tree, not
+just the element being addressed. It's automatically skipped for `type` and
+for `click`/`scroll` when addressed by `elementId` — those already
+re-resolve that exact element by its UIA RuntimeId immediately before
+acting and fail loudly if it's gone, so the coarser whole-tree hash adds no
+real safety there and only false-positives on unrelated live content
+elsewhere in the window (a clock, a status indicator, a "page loading"
+spinner, autocomplete, scrollbar position). It still applies to
+coordinate-based `click`s and to `key` (neither has anything else
+re-verifying the target), and to those you can set `staleCheckTree: false`
+deployment-wide if a target window's content drifts too fast even for that.
+Identity and the observation-age check always apply regardless.
 
 ## Configuration
 

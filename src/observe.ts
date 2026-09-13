@@ -112,16 +112,25 @@ export class ObservationStore {
 
   /**
    * Compare a fresh re-observation against the cited record. The verdict is
-   * `ok` only when identity (window/pid/exe/title/class/rect), the tree hash,
-   * and — when `staleCheckPixels` is on — the pixel hash all still match, and
-   * the record is not older than `maxObservationAgeMs`.
+   * `ok` only when identity (window/pid/exe/title/class/rect), the tree hash
+   * (when `checkTree` is true and `staleCheckTree` is on), and the pixel hash
+   * (when `staleCheckPixels` is on) all still match, and the record is not
+   * older than `maxObservationAgeMs`.
    *
    * @param record - the observation the action cites.
    * @param fresh - the re-observation captured immediately before the action.
    * @param now - wall-clock now (injectable for tests).
+   * @param checkTree - whether the tree hash is even relevant to this call.
+   * Element-addressed actions (`type`, `click`/`scroll` by `elementId`) pass
+   * `false`: the helper re-resolves that exact element by its UIA RuntimeId
+   * immediately before acting and fails loudly if it's gone, so the coarser
+   * whole-window tree hash adds no safety there — it only false-positives on
+   * unrelated live content elsewhere in the window (a clock, a page still
+   * loading, autocomplete appearing). Coordinate-based clicks and `key` have
+   * no such per-target re-check, so they still want it (default `true`).
    * @returns the verdict.
    */
-  verify(record: ObservationRecord, fresh: WindowSnapshot, now: number = Date.now()): FreshnessVerdict {
+  verify(record: ObservationRecord, fresh: WindowSnapshot, now: number = Date.now(), checkTree = true): FreshnessVerdict {
     if (now - record.observedAt > this.config.maxObservationAgeMs) {
       return {
         ok: false,
@@ -143,7 +152,7 @@ export class ObservationStore {
         detail: `window ${record.windowId} no longer matches observation ${record.id} (title/class/process or rect changed)`,
       }
     }
-    if (this.config.staleCheckTree && fresh.treeHash !== record.treeHash) {
+    if (checkTree && this.config.staleCheckTree && fresh.treeHash !== record.treeHash) {
       return {
         ok: false,
         code: 'STALE_TREE',

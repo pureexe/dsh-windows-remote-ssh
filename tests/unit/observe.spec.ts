@@ -45,6 +45,20 @@ describe('ObservationStore', () => {
     if (!verdict.ok) expect(verdict.code).toBe('STALE_TREE')
   })
 
+  it('ignores tree drift when the call itself opts out via checkTree=false (element-addressed actions re-verify their own target another way)', () => {
+    const store = new ObservationStore(baseConfig)
+    const record = store.record(snapshot(), target)
+    const verdict = store.verify(record, snapshot({ treeHash: 'different' }), undefined, false)
+    expect(verdict.ok).toBe(true)
+  })
+
+  it('still checks the tree when checkTree=true even if a caller passes it explicitly', () => {
+    const store = new ObservationStore(baseConfig)
+    const record = store.record(snapshot(), target)
+    const verdict = store.verify(record, snapshot({ treeHash: 'different' }), undefined, true)
+    expect(verdict.ok).toBe(false)
+  })
+
   it('ignores tree drift when staleCheckTree is off (e.g. a clock/tooltip elsewhere in the same window)', () => {
     const config = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, staleCheckTree: false })
     const store = new ObservationStore(config)
