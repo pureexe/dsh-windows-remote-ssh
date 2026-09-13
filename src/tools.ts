@@ -1203,15 +1203,30 @@ export function filesystemPushTool(services: ToolServices) {
         if (attachments === undefined) {
           throw new Error(`filesystem_push: no attachment store mounted, cannot resolve the given ${parsed.image !== undefined ? 'image' : 'file'} reference`)
         }
-        if (parsed.image !== undefined) {
-          const stored = await attachments.readImage(parsed.image, exec.signal)
-          data = Buffer.from(stored.data)
-        } else {
-          const chunks: Buffer[] = []
-          for await (const chunk of attachments.readFileStream(parsed.file as FileAttachmentRef, exec.signal)) {
-            chunks.push(Buffer.from(chunk))
+        try {
+          if (parsed.image !== undefined) {
+            const stored = await attachments.readImage(parsed.image, exec.signal)
+            data = Buffer.from(stored.data)
+          } else {
+            const chunks: Buffer[] = []
+            for await (const chunk of attachments.readFileStream(parsed.file as FileAttachmentRef, exec.signal)) {
+              chunks.push(Buffer.from(chunk))
+            }
+            data = Buffer.concat(chunks)
           }
-          data = Buffer.concat(chunks)
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error)
+          // The attachment store's own ids are opaque and content-addressed -
+          // never derivable by inspecting its on-disk object layout. A
+          // reference rejected here almost always means it was hand-built
+          // (e.g. from a filename glimpsed in a shell command) instead of
+          // being the exact object an earlier tool call (filesystem_pull,
+          // screen_shot, ...) returned.
+          throw new Error(
+            `filesystem_push: could not resolve the given ${parsed.image !== undefined ? 'image' : 'file'} reference (${message}). `
+            + 'Re-supply the reference exactly as an earlier tool call returned it - do not construct or edit an attachmentId '
+            + 'by hand (for example from a path seen while inspecting the attachment store on disk); it is an opaque id, not a filename.',
+          )
         }
       }
 
