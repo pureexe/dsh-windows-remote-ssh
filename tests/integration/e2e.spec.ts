@@ -14,7 +14,7 @@
  * reachable target (CI, most dev machines).
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { resolveConfig, resolveSshTarget, type ResolvedConfig, type ResolvedSshConfig } from '../../src/config.ts'
 import { SshConnectionManager } from '../../src/ssh/client.ts'
 import { SshHelperBackend } from '../../src/platform/runner.ts'
@@ -172,5 +172,284 @@ describe.skipIf(!hasTarget)('remote Windows host over SSH (live integration)', (
     } finally {
       overridePool.close()
     }
+  })
+
+  it('runs an arbitrary PowerShell script and captures stdout/exit code', async () => {
+    const outcome = await backend.powershell("Write-Output 'dsh-windows-remote-ssh-e2e-marker'; exit 0", 15_000)
+    expect(outcome.exitCode).toBe(0)
+    expect(outcome.stdout).toContain('dsh-windows-remote-ssh-e2e-marker')
+    expect(outcome.truncated).toBe(false)
+  })
+
+  it('captures a non-zero exit code and stderr from a failing script', async () => {
+    const outcome = await backend.powershell("Write-Error 'dsh-windows-remote-ssh-e2e-failure'; exit 7", 15_000)
+    expect(outcome.exitCode).toBe(7)
+    expect(outcome.stderr).toContain('dsh-windows-remote-ssh-e2e-failure')
+  })
+
+  it('kills a script that runs past its timeout', async () => {
+    await expect(backend.powershell('Start-Sleep -Seconds 30', 1_500)).rejects.toThrow(/did not finish within/iu)
+  })
+
+  it('pushes and pulls a text file round-trip', async () => {
+    const tempDir = (await backend.powershell('Write-Output $env:TEMP', 10_000)).stdout.trim()
+    const remotePath = `${tempDir}\\dsh-fs-e2e-${Date.now()}.txt`
+    const content = Buffer.from('dsh-windows-remote-ssh filesystem round-trip test\nline two', 'utf8')
+    try {
+      const pushOutcome = await backend.pushFile(remotePath, content, true)
+      expect(pushOutcome.bytesWritten).toBe(content.length)
+      const pulled = await backend.pullFile(remotePath)
+      expect(pulled.equals(content)).toBe(true)
+    } finally {
+      await backend.powershell(`Remove-Item -Path "${remotePath}" -Force -ErrorAction SilentlyContinue`, 10_000)
+    }
+  })
+
+  it('pushes and pulls arbitrary binary content round-trip byte-for-byte', async () => {
+    const tempDir = (await backend.powershell('Write-Output $env:TEMP', 10_000)).stdout.trim()
+    const remotePath = `${tempDir}\\dsh-fs-e2e-${Date.now()}.bin`
+    // Non-text bytes (including a null byte and a lone invalid UTF-8 byte) -
+    // this exercises raw SFTP transfer fidelity, not the image/text
+    // classification logic (that's unit-tested separately in filesystem.spec.ts).
+    const content = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x80, 0x10, 0x20])
+    try {
+      await backend.pushFile(remotePath, content, true)
+      const pulled = await backend.pullFile(remotePath)
+      expect(pulled.equals(content)).toBe(true)
+    } finally {
+      await backend.powershell(`Remove-Item -Path "${remotePath}" -Force -ErrorAction SilentlyContinue`, 10_000)
+    }
+  })
+
+  it('creates missing parent directories when pushing with createDirectories: true', async () => {
+    const tempDir = (await backend.powershell('Write-Output $env:TEMP', 10_000)).stdout.trim()
+    const nestedDir = `${tempDir}\\dsh-fs-e2e-nested-${Date.now()}`
+    const remotePath = `${nestedDir}\\sub\\file.txt`
+    try {
+      await backend.pushFile(remotePath, Buffer.from('nested', 'utf8'), true)
+      const pulled = await backend.pullFile(remotePath)
+      expect(pulled.toString('utf8')).toBe('nested')
+    } finally {
+      await backend.powershell(`Remove-Item -Path "${nestedDir}" -Recurse -Force -ErrorAction SilentlyContinue`, 10_000)
+    }
+  })
+
+  it('refuses to push content over maxFilesystemTransferBytes', async () => {
+    const tempDir = (await backend.powershell('Write-Output $env:TEMP', 10_000)).stdout.trim()
+    const remotePath = `${tempDir}\\dsh-fs-e2e-should-not-exist-${Date.now()}.txt`
+    const tinyCapConfig = { ...config, maxFilesystemTransferBytes: 10 }
+    const tinyPool = new SshHelperBackend(tinyCapConfig)
+    try {
+      const tinyBackend = tinyPool.getBackend(target)
+      await expect(tinyBackend.pushFile(remotePath, Buffer.from('this is definitely more than ten bytes'), true))
+        .rejects.toThrow(/maxFilesystemTransferBytes/iu)
+    } finally {
+      tinyPool.close()
+    }
+  })
+
+  it('refuses to pull a file over maxFilesystemTransferBytes without downloading it', async () => {
+    const tempDir = (await backend.powershell('Write-Output $env:TEMP', 10_000)).stdout.trim()
+    const remotePath = `${tempDir}\\dsh-fs-e2e-oversized-${Date.now()}.txt`
+    try {
+      await backend.pushFile(remotePath, Buffer.from('this file is bigger than a tiny cap'), true)
+      const tinyCapConfig = { ...config, maxFilesystemTransferBytes: 10 }
+      const tinyPool = new SshHelperBackend(tinyCapConfig)
+      try {
+        const tinyBackend = tinyPool.getBackend(target)
+        await expect(tinyBackend.pullFile(remotePath)).rejects.toThrow(/maxFilesystemTransferBytes/iu)
+      } finally {
+        tinyPool.close()
+      }
+    } finally {
+      await backend.powershell(`Remove-Item -Path "${remotePath}" -Force -ErrorAction SilentlyContinue`, 10_000)
+    }
+  })
+
+  describe('the 9 new capabilities (move, wait_for primitives, clipboard, process, display_list, screen_shot region/display, notify, multi_action primitives, window_control)', () => {
+    /** Launch an app and poll app_list until it owns a visible window; returns its windowId. Mirrors what wait_for's own polling loop does over app_list/tree. */
+    async function launchAndWaitForWindow(name = 'notepad'): Promise<{ pid: number; windowId: number }> {
+      const launch = await backend.launch(name, [])
+      let windowId: number | undefined
+      for (let attempt = 0; attempt < 20 && windowId === undefined; attempt += 1) {
+        const apps = await backend.apps()
+        const app = apps.find(candidate => candidate.processId === launch.processId)
+        if (app !== undefined && app.windows.length > 0) {
+          windowId = app.windows[0]!.windowId
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 300))
+        }
+      }
+      expect(windowId).toBeDefined()
+      return { pid: launch.processId, windowId: windowId as number }
+    }
+
+    let extraPid: number | undefined
+
+    afterEach(async () => {
+      if (extraPid !== undefined) {
+        await cleanup.exec(`taskkill /F /PID ${extraPid}`).catch(() => undefined)
+        extraPid = undefined
+      }
+    })
+
+    it('display_list: enumerates at least one monitor, one of them primary', async () => {
+      const displays = await backend.displays()
+      expect(Array.isArray(displays)).toBe(true)
+      expect(displays.length).toBeGreaterThan(0)
+      expect(displays.some(display => display.primary)).toBe(true)
+      for (const display of displays) {
+        expect(display.rect.width).toBeGreaterThan(0)
+        expect(display.rect.height).toBeGreaterThan(0)
+      }
+    })
+
+    it('screen_shot region: captures exactly the requested screen-space rectangle', async () => {
+      const shot = await backend.shot({}, 800, false, { region: { left: 0, top: 0, right: 200, bottom: 150 } })
+      expect(shot.snapshot.windowId).toBe(0)
+      expect(shot.snapshot.rect).toEqual({ x: 0, y: 0, width: 200, height: 150 })
+      expect(shot.width).toBeGreaterThan(0)
+      expect(shot.height).toBeGreaterThan(0)
+    })
+
+    it('screen_shot wholeScreen + display: captures a specific monitor by index', async () => {
+      const displays = await backend.displays()
+      const shot = await backend.shot({}, 800, true, { display: 0 })
+      expect(shot.snapshot.windowId).toBe(0)
+      expect(shot.snapshot.rect.width).toBe(displays[0]!.rect.width)
+      expect(shot.snapshot.rect.height).toBe(displays[0]!.rect.height)
+    })
+
+    it('screen_shot with neither region nor display still behaves exactly as before (backward compatibility)', async () => {
+      const shot = await backend.shot({}, 1024, true)
+      expect(shot.snapshot.windowId).toBe(0)
+      expect(shot.snapshot.title).toBe('primary screen')
+    })
+
+    it('clipboard: round-trips a set value through get', async () => {
+      const marker = `dsh-clipboard-e2e-${Date.now()}`
+      await backend.clipboardSet(marker)
+      const text = await backend.clipboardGet()
+      expect(text.trim()).toBe(marker)
+    })
+
+    it('process list: includes a freshly launched process', async () => {
+      const { pid } = await launchAndWaitForWindow()
+      extraPid = pid
+      const processes = await backend.processList()
+      expect(Array.isArray(processes)).toBe(true)
+      expect(processes.some(process => process.pid === pid)).toBe(true)
+    })
+
+    it('process kill: kills a process by pid', async () => {
+      const { pid } = await launchAndWaitForWindow()
+      const outcome = await backend.processKill({ pid, force: true })
+      expect(outcome.killedPids).toContain(pid)
+      let stillRunning = true
+      for (let attempt = 0; attempt < 20 && stillRunning; attempt += 1) {
+        const processes = await backend.processList()
+        stillRunning = processes.some(process => process.pid === pid)
+        if (stillRunning) await new Promise(resolve => setTimeout(resolve, 300))
+      }
+      expect(stillRunning).toBe(false)
+    })
+
+    it('move: moves and drags the mouse inside a window via posted messages without error', async () => {
+      const { pid, windowId } = await launchAndWaitForWindow()
+      extraPid = pid
+      const tree = await backend.tree({ windowId }, 50, 10, false)
+      const rect = tree.snapshot.rect
+      const outcome = await backend.move({
+        windowId,
+        x: rect.x + 20,
+        y: rect.y + 20,
+        drag: { toX: rect.x + 60, toY: rect.y + 60 },
+      }, false)
+      expect(outcome.delivered).toBe('posted')
+      expect(outcome.processBefore.pid).toBe(outcome.processAfter.pid)
+    })
+
+    it('window_control: minimizes and restores a window, reflected in listWindows()', async () => {
+      const { pid, windowId } = await launchAndWaitForWindow()
+      extraPid = pid
+
+      await backend.windowControl({ windowId, action: 'minimize' }, false)
+      await new Promise(resolve => setTimeout(resolve, 500))
+      const afterMinimize = (await backend.listWindows()).find(window => window.windowId === windowId)
+      expect(afterMinimize?.minimized).toBe(true)
+
+      await backend.windowControl({ windowId, action: 'restore' }, false)
+      await new Promise(resolve => setTimeout(resolve, 500))
+      const afterRestore = (await backend.listWindows()).find(window => window.windowId === windowId)
+      expect(afterRestore?.minimized).toBe(false)
+    })
+
+    it('window_control: moves and resizes a window to an exact rect', async () => {
+      const { pid, windowId } = await launchAndWaitForWindow()
+      extraPid = pid
+
+      await backend.windowControl({ windowId, action: 'move', x: 40, y: 40 }, false)
+      await backend.windowControl({ windowId, action: 'resize', width: 500, height: 400 }, false)
+      await new Promise(resolve => setTimeout(resolve, 500))
+      const after = (await backend.listWindows()).find(window => window.windowId === windowId)
+      expect(after?.rect.width).toBe(500)
+      expect(after?.rect.height).toBe(400)
+    })
+
+    it('window_control: closes a window (uses cmd.exe, a classic Win32 console window, rather than Notepad - Windows 11\'s Notepad is a packaged app whose visible window is hosted by a frame process and does not reliably tear down on a posted WM_CLOSE the way a plain top-level window does; that is a property of that specific app, not of window_control\'s close action)', async () => {
+      const { pid, windowId } = await launchAndWaitForWindow('cmd')
+      // Best-effort cleanup regardless of whether the app fully exits on its own.
+      extraPid = pid
+      await backend.windowControl({ windowId, action: 'close' }, false)
+      let windowGone = false
+      for (let attempt = 0; attempt < 20 && !windowGone; attempt += 1) {
+        const windows = await backend.listWindows()
+        windowGone = !windows.some(window => window.windowId === windowId)
+        if (!windowGone) await new Promise(resolve => setTimeout(resolve, 300))
+      }
+      expect(windowGone).toBe(true)
+    })
+
+    it('notify: shows a real Windows Action Center toast notification', async () => {
+      await expect(backend.notify(
+        'dsh-windows-remote-ssh',
+        'integration test toast (safe to dismiss or ignore)',
+        config.notifyAppId,
+      )).resolves.toBeUndefined()
+    })
+
+    it('wait_for primitive: polling apps() detects a freshly launched process appearing', async () => {
+      const launch = await backend.launch('notepad', [])
+      extraPid = launch.processId
+      let sawWindow = false
+      const start = Date.now()
+      while (!sawWindow && Date.now() - start < 10_000) {
+        const apps = await backend.apps()
+        sawWindow = apps.some(app => app.processId === launch.processId)
+        if (!sawWindow) await new Promise(resolve => setTimeout(resolve, 500))
+      }
+      expect(sawWindow).toBe(true)
+    })
+
+    it('multi_action primitive: runs click then type sequentially against the same window', async () => {
+      const { pid, windowId } = await launchAndWaitForWindow()
+      extraPid = pid
+      const tree = await backend.tree({ windowId }, 500, 32, false)
+      const editable = tree.elements.find(element => element.patterns.includes('value'))
+      expect(editable).toBeDefined()
+      if (editable === undefined) return
+
+      const clickOutcome = await backend.click({ windowId, elementId: editable.elementId, button: 'left' }, false)
+      expect(['uia', 'posted']).toContain(clickOutcome.delivered)
+
+      const typeOutcome = await backend.type({
+        windowId,
+        elementId: editable.elementId,
+        text: 'multi_action mechanism test',
+        rollback: true,
+      }, false)
+      expect(['uia', 'posted']).toContain(typeOutcome.delivered)
+      expect(typeOutcome.processBefore.pid).toBe(typeOutcome.processAfter.pid)
+    })
   })
 })

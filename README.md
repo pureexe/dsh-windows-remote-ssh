@@ -116,7 +116,7 @@ If `host`/`user` are given (in chat, or in `config.ssh`) but neither
 identity on the machine running the harness — `~/.ssh/id_ed25519`,
 `id_ecdsa`, then `id_rsa`, the same lookup order the plain `ssh` CLI uses —
 before failing with "requires either a password or a privateKeyPath". This
-is what lets "connect to 10.0.0.12 as pakkapon" work with no credential in
+is what lets "connect to 10.0.0.12 as alice" work with no credential in
 the call at all, as long as that machine's default key is already
 authorized on the target.
 
@@ -133,19 +133,218 @@ silently guesses or hangs.
 
 | Tool | Read-only | Approval | Purpose |
 |------|-----------|----------|---------|
-| `screen_shot` | ✅ | — | Capture a window/screen as an image attachment (or text-only description with `imageMode: 'text'`) |
+| `screen_shot` | ✅ | — | Capture a window/screen (or a `region`/`display`) as an image attachment (or text-only description with `imageMode: 'text'`) |
 | `screen_read` | ✅ | — | UI Automation accessibility tree + pixel-location hints |
-| `app_list` | ✅ | — | Enumerate running applications and their windows |
+| `app_list` | ✅ | — | Enumerate running applications and their windows (now includes `minimized`/`maximized`) |
+| `display_list` | ✅ | — | Enumerate every monitor: index, rect, whether primary |
+| `wait_for` | ✅ | — | Poll (~500ms) until a condition is met or times out, then return a fresh observation |
+| `clipboard` (get) | ✅ | — | Read the remote clipboard text |
+| `process` (list) | ✅ | — | List running processes |
 | `click` | | Yes | Click an element (by id) or a coordinate |
 | `type` | | Yes | Type text into an editable element, with rollback on failure |
 | `scroll` | | Yes | Scroll an element or the window |
 | `key` | | Yes | Send a key combination (e.g. `Ctrl+S`) |
+| `move` | | Yes | Move the mouse, or drag, via posted window messages only |
+| `multi_action` | | Yes | Run a batch of click/type sub-actions (with optional list `selectionMode`) against one observation |
+| `window_control` | | Yes | Minimize/maximize/restore/move/resize/close a window |
 | `app_launch` | | Yes | Launch an application by name or path |
+| `filesystem_pull` | | Yes | Download a file from the remote host (image → attachment, small text → inline, else → file attachment) |
+| `filesystem_push` | | Yes | Upload a file to the remote host, from literal content or a re-supplied attachment reference |
+| `clipboard` (set) | | Yes | Replace the remote clipboard text |
+| `process` (kill) | | Yes | Kill one or more processes by pid or name |
+| `notify` | | Yes | Show a real Windows Action Center toast notification |
+| `powershell` | | Yes | Run an arbitrary script with full user privileges — off by default, see below |
 
-`screen_shot`/`screen_read`/`app_list`/`app_launch` each accept an optional
-`ssh` argument (see **Supplying the SSH target** above) for deployments with
-no configured default. `click`/`type`/`scroll`/`key` never take one — they
-replay against whichever host their cited `basedOn` observation came from.
+### `filesystem_pull` / `filesystem_push` — move files between the two machines
+
+Download a file from the remote Windows host to inspect it here, and upload
+it back after editing — useful for a config file, a script, or an image.
+
+- `filesystem_pull(remotePath)` downloads the file and, depending on what it
+  is: an **image** comes back as a real image attachment (the same
+  mechanism `screen_shot` uses — actually visible, not just bytes); small
+  **text** comes back inline as a plain string the model can read and
+  reason about directly; anything else becomes a generic **file**
+  attachment. Every case returns a reference (or the text itself) that
+  `filesystem_push` can consume to write it straight back.
+- `filesystem_push(remotePath, ...)` takes exactly one of: `content` (a
+  literal string — the natural way to write back an edited text/config
+  file), or `image`/`file` (an attachment reference re-supplied *exactly*
+  as an earlier `filesystem_pull` returned it, to write those exact bytes
+  back unchanged — e.g. after some other tool produced an edited version of
+  a pulled image). Creates missing parent directories by default.
+- Both are gated by **approval** like a mutating action — unlike
+  `screen_shot`/`screen_read`, reading (or writing) an arbitrary path isn't
+  treated as a free "observer": it can expose content the operator never
+  put on screen.
+- `maxFilesystemTransferBytes` (default 10 MB) caps one transfer in either
+  direction; going over it refuses outright rather than truncating (which
+  would just corrupt binary content). `maxInlineFilesystemBytes` (default
+  100 KB) is the smaller threshold above which a *pulled* text file is
+  stored as a file attachment instead of inlined, so a merely-large file
+  doesn't bloat the model's context.
+
+### `move` — mouse move and drag (posted messages only, honest limits)
+
+`move` posts `WM_MOUSEMOVE` to reach a point inside an observed window and,
+when `drag: { toX, toY }` (or `toElementId`) is given, also posts
+`WM_LBUTTONDOWN` at the source, several interpolated `WM_MOUSEMOVE` steps
+toward the destination, and `WM_LBUTTONUP` there — exactly like every other
+action in this plugin, the real OS cursor never moves and no window is
+brought to the foreground unless `focusFallback: 'allow'`.
+
+**Be honest about what posted-message drag can and cannot do.** It reliably
+works for controls that react to simple mouse-move/button events — sliders,
+canvases, custom-drawn controls that track the mouse themselves. It is **not**
+real OLE/shell drag-and-drop: dragging a file between two Explorer windows (or
+anything else that relies on Windows' own drag-detection heuristics and
+`IDropTarget`/`IDataObject` negotiation) generally will **not** work through
+posted messages — that requires actual `SendInput`-driven physical mouse
+events, which this plugin deliberately never generates. Use `move`/`drag` for
+UI manipulation within a single control, not for cross-application drag
+operations.
+
+### `wait_for` — poll for a condition instead of guessing a fixed delay
+
+`wait_for` polls the remote host roughly every 500ms until a condition is met
+or `timeoutMs` elapses (default `waitForTimeoutMs`, bounded 500..120000),
+entirely on the harness side (repeated `screen_read`-equivalent/`app_list`-equivalent
+calls) — no new native helper operation was needed for this one. Three
+condition kinds:
+
+- `kind: 'element'` — `target` names a window (as `screen_shot`/`screen_read`
+  do) and `match` (`name`/`automationId`/`controlType`, at least one,
+  case-insensitive substring) names what to look for in its accessibility
+  tree.
+- `kind: 'window'` — `match.title` names a substring to look for across every
+  top-level window's title.
+- `kind: 'foreground'` — `target` names a window that must exist and be the
+  current foreground window.
+
+**A timeout is not an error.** The result always comes back as a normal tool
+result carrying `met` (`false` on timeout), `timedOut`, and whatever was last
+observed (`observationId`, `window`, `elements`, `pixels`) — the model needs
+to see what is actually on screen when a wait times out, not just a generic
+failure.
+
+### `clipboard` — get/set the remote clipboard text
+
+Backed by `Get-Clipboard`/`Set-Clipboard` (built into PowerShell 5.1 on
+Windows, no extra module), run inside the same interactive Scheduled-Task
+session as every other operation — the clipboard is per-session, so a plain
+non-interactive SSH exec would see an entirely different, empty clipboard.
+`action: 'get'` is read-only and never needs approval (like `app_list`);
+`action: 'set'` is mutating and requires approval unless `requireApproval` is
+off, gated the same way `powershell` is (no window subject — the clipboard
+isn't scoped to any one window).
+
+### `process` — list or kill remote processes
+
+Backed by `Get-Process`/`Stop-Process`. `action: 'list'` returns pid, name,
+executable path (when resolvable), and main window title (when any) for
+every running process — read-only, never needs approval. `action: 'kill'`
+takes `pid` or `name` (exactly one) plus optional `force`, and is gated by
+approval like `powershell`/`clipboard` `set` (no window subject).
+
+### `display_list` and multi-monitor / region `screen_shot`
+
+`display_list` enumerates every monitor via
+`[System.Windows.Forms.Screen]::AllScreens` — index, screen-space rect, and
+whether it's the primary display. Read-only, never needs approval.
+
+`screen_shot` gained two optional, backward-compatible parameters:
+`display: N` (with `wholeScreen: true`) captures one specific monitor's
+bounds instead of the primary screen, and `region: { left, top, right,
+bottom }` captures exactly that screen-space rectangle regardless of
+`target`/`wholeScreen`/`display`. Neither parameter changes anything about an
+existing call that supplies neither — a plain `screen_shot()` or
+`screen_shot({ wholeScreen: true })` behaves exactly as before. Like
+`wholeScreen`, a `region`/`display` capture's `windowId` is the `0` sentinel
+and cannot be used as a `basedOn` target for a later action.
+
+### `notify` — a real Windows Action Center toast
+
+`notify` shows an actual Windows 11 (and 10) Action Center toast
+notification — not a legacy balloon-tip/`NotifyIcon` popup — via the WinRT
+`Windows.UI.Notifications.ToastNotificationManager` APIs, loaded from
+PowerShell 5.1 through the standard reflection-load technique
+(`[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]`).
+It defaults to the well-known built-in Windows PowerShell AUMID
+(`{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe`,
+configurable via `notifyAppId`, overridable per call with `appId`) so it
+works out of the box on stock Windows 10/11 with no app registration — the
+standard community technique for toasting from PowerShell. Mutating: gated
+by approval like `powershell` (no window subject).
+
+### `multi_action` — a batch of click/type sub-actions, plus list selection
+
+`multi_action` runs a sequence of click/type sub-actions against **one**
+cited `basedOn` observation in a single tool call and a single approval ask
+— rather than one `click`/`type` call (and one approval prompt) per step.
+Each step reuses the exact same `click`/`type` addressing and re-verification
+`click`/`type` already do on their own (an `elementId` step re-resolves that
+exact element by UIA RuntimeId right before acting; a coordinate step does
+not). By default the batch stops at the first failing step; `continueOnError:
+true` runs every step regardless and returns one outcome (or error) per step.
+
+For list/grid multi-selection, a click-kind step may set `selectionMode`
+(`'select'`/`'add'`/`'remove'`/`'toggle'`): when the addressed element
+supports UIA's `SelectionItem` pattern, this invokes `Select()` /
+`AddToSelection()` / `RemoveFromSelection()` directly instead of posting a
+click — more reliable than synthesizing modifier-key-held clicks, and it
+never needs to hold a real modifier key down. Falls back to a plain posted
+click when the element doesn't support the pattern.
+
+### `window_control` — minimize/maximize/restore/move/resize/close
+
+`window_control` changes one observed window's state via `ShowWindow`
+(minimize/maximize/restore) and `MoveWindow` (move/resize) Win32 calls, or
+posts `WM_CLOSE` (close). Requires `basedOn` and approval, exactly like
+`click`/`scroll`/`key` (participates in `autoApproveWindows`). Since a
+successful `move`/`resize`/`minimize`/`maximize` changes the window's own
+rect/state, a subsequent action against the same window needs a fresh
+`screen_shot`/`screen_read` first — the same freshness rule that already
+applies everywhere else. `app_list`'s window entries (and the underlying
+`WindowInfo` shape) now also carry `minimized`/`maximized` booleans
+(`IsIconic`/`IsZoomed`), at no extra cost.
+
+### `powershell` — the escape hatch (off by default)
+
+`powershell` runs any script on the remote host with the full privileges of
+the connected user: not scoped to a window or element, not sandboxed beyond
+what that account can already do. It exists for whatever the structured
+tools above can't reach (reading/writing files, querying system state,
+managing services, registry access, ...). It's categorically more powerful
+than every other tool this plugin registers, so:
+
+- It's **disabled by default**. Turn it on deliberately:
+  ```yaml
+  config:
+    enablePowerShellTool: true
+  ```
+- It's still gated by **approval** on the same terms as every other
+  mutating action (`requireApproval` / `autoApproveWindows`) — enabling it
+  does not bypass that.
+- It does **not** participate in the freshness/staleness machinery
+  (`basedOn`, `staleCheckTree`, etc.) at all — there's no window to be stale
+  about.
+- Output is capped at `maxPowerShellOutputLength` (default 20000 characters
+  each for stdout/stderr, independently truncated) and redacted the same
+  way every other model-visible string is (credential-shaped text stripped
+  before it reaches the model or a log).
+- `powerShellTimeoutMs` (default 30000, independent of `helperTimeoutMs`)
+  bounds one call; the remote process is killed if it runs longer.
+
+Think carefully before turning this on for any deployment where the model
+isn't fully trusted with the target machine — it is, by design, equivalent
+to giving the model a terminal.
+
+`screen_shot`/`screen_read`/`app_list`/`app_launch`/`filesystem_pull`/`filesystem_push`/`display_list`/`wait_for`/`clipboard`/`process`/`notify`/`powershell`
+each accept an optional `ssh` argument (see **Supplying the SSH target**
+above) for deployments with no configured default.
+`click`/`type`/`scroll`/`key`/`move`/`multi_action`/`window_control` never
+take one — they replay against whichever host their cited `basedOn`
+observation came from.
 
 Every mutating action (`click`/`type`/`scroll`/`key`/`app_launch`) must cite
 a `basedOn` observation returned by `screen_shot`/`screen_read`. Before
@@ -178,7 +377,10 @@ commented `cordis.patch.yml` for the complete list and defaults:
 `focusFallback`, `imageMode`, `connectTimeoutMs`, `helperTimeoutMs`,
 `maxScreenshotSide`, `staleCheckTree`, `staleCheckPixels`, `maxObservationAgeMs`,
 `maxCachedObservations`, `maxElements`, `maxTreeDepth`, `maxTextLength`,
-`rollbackEnabled`.
+`rollbackEnabled`, `enablePowerShellTool`, `powerShellTimeoutMs`,
+`maxPowerShellOutputLength`, `maxFilesystemTransferBytes`,
+`maxInlineFilesystemBytes`, `waitForTimeoutMs`, `notifyAppId`,
+`maxMultiActionSteps`.
 
 ## Development
 

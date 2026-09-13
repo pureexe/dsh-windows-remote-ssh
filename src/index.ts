@@ -5,7 +5,10 @@
  * a local subprocess).
  *
  * Host-only function plugin — no default export (the Loader unwraps
- * `exports.default ?? exports`). It registers eight tools behind one shared
+ * `exports.default ?? exports`). It registers a growing family of tools
+ * (screen/window observers, click/type/scroll/key/move/window_control/
+ * multi_action mutators, app/process/clipboard/display/notify/filesystem
+ * helpers, and the optional `powershell` escape hatch) behind one shared
  * safety boundary: observations are structured text (accessibility tree +
  * pixel hints) so text-only models work, mutating actions must cite a fresh
  * observation and pass approval (or the configured window allowlist), the

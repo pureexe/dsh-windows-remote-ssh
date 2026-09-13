@@ -99,3 +99,45 @@
         # Back up and restore control text when `type` fails (true = restore
         # the original text; false = leave the partially typed text).
         rollbackEnabled: true
+        # Register the `powershell` tool: runs an arbitrary script on the
+        # remote host with the connected user's full privileges - not scoped
+        # to any window or element, not sandboxed beyond what that account
+        # can already do. Categorically more powerful than every other tool
+        # this plugin registers, so it is off by default; turn it on only
+        # for a deployment where the model is fully trusted with the target
+        # machine. Still gated by approval like every other mutating action
+        # when enabled.
+        enablePowerShellTool: true
+        # Per-`powershell`-call timeout in milliseconds (1..600000),
+        # independent of helperTimeoutMs since scripts may legitimately run
+        # longer. The remote process is killed if it runs past this.
+        powerShellTimeoutMs: 30000
+        # Cap on stdout/stderr length one `powershell` call returns
+        # (1..200000), each truncated independently.
+        maxPowerShellOutputLength: 20000
+        # Cap on one filesystem_pull/filesystem_push transfer in bytes
+        # (1..100000000, i.e. up to 100 MB). A pull of a larger remote file,
+        # or a push of larger content, is refused outright rather than
+        # truncated - truncating binary content would just corrupt it.
+        maxFilesystemTransferBytes: 10000000
+        # Above this many bytes (1..maxFilesystemTransferBytes),
+        # filesystem_pull saves the file as an attachment (image or generic
+        # file) instead of inlining it as text in the tool result, so a
+        # merely-large-but-under-the-transfer-cap text file doesn't bloat
+        # the model's context.
+        maxInlineFilesystemBytes: 100000
+        # Default timeout in milliseconds for wait_for when a call doesn't
+        # supply its own (500..120000). wait_for polls roughly every 500ms
+        # until its condition is met or this elapses; a timeout is returned
+        # as a normal result (met: false), never an error.
+        waitForTimeoutMs: 10000
+        # Default AUMID notify toasts under when a call doesn't supply its
+        # own appId. The built-in Windows PowerShell AUMID works on stock
+        # Windows 10/11 with no app registration - the standard technique
+        # for toasting from PowerShell. Override only if a specific
+        # registered app identity is required.
+        notifyAppId: "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe"
+        # Cap on the number of sub-actions one multi_action call may batch
+        # (1..100). A single tool call staying bounded, not a substitute for
+        # a real scripting loop.
+        maxMultiActionSteps: 20

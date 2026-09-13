@@ -10,6 +10,7 @@
  * @module dsh-windows-remote-ssh/ssh/client
  */
 
+import path from 'node:path'
 import { Client, type ClientChannel, type SFTPWrapper } from 'ssh2'
 import { RemoteSshError } from '../platform/types.ts'
 import type { ResolvedSshConfig } from '../config.ts'
@@ -147,6 +148,18 @@ export class SshConnectionManager {
     })
   }
 
+  /** Stat a remote file's size without reading its bytes — a pre-flight check before a potentially large `readFile`. */
+  async statSize(remotePath: string): Promise<number> {
+    const sftp = await this.sftp()
+    return new Promise<number>((resolve, reject) => {
+      sftp.stat(remotePath, (err, stats) => {
+        sftp.end()
+        if (err) reject(new RemoteSshError(`stat ${remotePath} over SFTP failed: ${err.message}`, 'SFTP_FAILED'))
+        else resolve(stats.size)
+      })
+    })
+  }
+
   /**
    * Create a remote directory; a failure that turns out to mean "it's
    * already there" is not an error. Windows OpenSSH's SFTP server reports
@@ -166,6 +179,28 @@ export class SshConnectionManager {
     sftp.end()
     if (stats?.isDirectory() === true) return
     throw new RemoteSshError(`creating remote directory ${remotePath} failed: ${mkdirError.message}`, 'SFTP_FAILED')
+  }
+
+  /**
+   * Create a remote directory and every missing ancestor (Windows paths,
+   * backslash-separated) — the `mkdir -p` this SFTP server has no single
+   * command for. Used by `filesystem_push` so writing to a not-yet-existing
+   * folder doesn't require a separate step.
+   *
+   * @param dirPath - the directory to ensure exists, e.g. `C:\Users\me\out`.
+   */
+  async ensureRemoteDir(dirPath: string): Promise<void> {
+    const chain: string[] = []
+    let current = path.win32.normalize(dirPath)
+    for (;;) {
+      chain.unshift(current)
+      const parent = path.win32.dirname(current)
+      if (parent === current) break
+      current = parent
+    }
+    for (const dir of chain) {
+      await this.mkdir(dir)
+    }
   }
 
   /** Best-effort remote file deletion; failures are swallowed (cleanup only). */
@@ -190,7 +225,28 @@ export class SshConnectionManager {
     this.cachedRemoteTemp ??= this.exec('cmd.exe /c echo %TEMP%').then((result) => {
       const dir = result.stdout.trim()
       if (result.code !== 0 || dir === '' || dir === '%TEMP%') {
-        throw new RemoteSshError('could not discover the remote %TEMP% directory', 'SSH_BOOTSTRAP_FAILED')
+        // A non-zero exit, empty output, or a literal unexpanded "%TEMP%"
+        // all mean the same thing: whatever ran on the other end wasn't cmd.exe
+        // interpreting this command line the way we expect - most commonly
+        // because the target's sshd_config sets `DefaultShell` to something
+        // other than cmd.exe (e.g. powershell.exe), which changes how an
+        // exec request's command string gets wrapped and can make our
+        // literal "cmd.exe /c echo %TEMP%" invocation fail or print
+        // "%TEMP%" back unexpanded instead of running it. Include the raw
+        // exit code/stdout/stderr so this is diagnosable from the tool
+        // error alone instead of a bare "could not discover" message.
+        const truncate = (text: string, max = 500): string => text.length > max ? `${text.slice(0, max)}...(truncated)` : text
+        const detail = [
+          `exit code: ${result.code ?? '(none)'}`,
+          `stdout: ${JSON.stringify(truncate(result.stdout))}`,
+          `stderr: ${JSON.stringify(truncate(result.stderr))}`,
+        ].join(', ')
+        throw new RemoteSshError(
+          `could not discover the remote %TEMP% directory (${detail}) - this usually means the target's sshd is not `
+          + 'using cmd.exe as its DefaultShell for exec requests (check sshd_config on the remote host); '
+          + 'the SSH connection and authentication themselves succeeded, since this command reached the host at all',
+          'SSH_BOOTSTRAP_FAILED',
+        )
       }
       return dir
     }).catch((error: unknown) => {

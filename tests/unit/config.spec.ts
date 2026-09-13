@@ -133,6 +133,75 @@ describe('resolveConfig', () => {
     expect(resolved.imageMode).toBe('auto')
     expect(resolved.rollbackEnabled).toBe(true)
     expect(resolved.ssh?.remoteWorkdir).toBe('dsh-rssh')
+    // The powershell tool is categorically more powerful than everything
+    // else this plugin registers, so it must default OFF, never silently on.
+    expect(resolved.enablePowerShellTool).toBe(false)
+    expect(resolved.powerShellTimeoutMs).toBe(30_000)
+    expect(resolved.maxPowerShellOutputLength).toBe(20_000)
+  })
+
+  it('accepts an explicit enablePowerShellTool: true', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, enablePowerShellTool: true })
+    expect(resolved.enablePowerShellTool).toBe(true)
+  })
+
+  it('rejects an out-of-range powerShellTimeoutMs', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, powerShellTimeoutMs: -1 })).toThrow(/powerShellTimeoutMs/u)
+  })
+
+  it('rejects an out-of-range maxPowerShellOutputLength', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxPowerShellOutputLength: 0 })).toThrow(/maxPowerShellOutputLength/u)
+  })
+
+  it('applies defaults for the filesystem_pull/filesystem_push transfer caps', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' } })
+    expect(resolved.maxFilesystemTransferBytes).toBe(10_000_000)
+    expect(resolved.maxInlineFilesystemBytes).toBe(100_000)
+  })
+
+  it('rejects an out-of-range maxFilesystemTransferBytes', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxFilesystemTransferBytes: 0 })).toThrow(/maxFilesystemTransferBytes/u)
+  })
+
+  it('rejects an out-of-range maxInlineFilesystemBytes', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxInlineFilesystemBytes: 0 })).toThrow(/maxInlineFilesystemBytes/u)
+  })
+
+  it('applies defaults for waitForTimeoutMs, notifyAppId, and maxMultiActionSteps', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' } })
+    expect(resolved.waitForTimeoutMs).toBe(10_000)
+    expect(resolved.notifyAppId).toBe('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe')
+    expect(resolved.maxMultiActionSteps).toBe(20)
+  })
+
+  it('rejects an out-of-range waitForTimeoutMs', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, waitForTimeoutMs: 100 })).toThrow(/waitForTimeoutMs/u)
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, waitForTimeoutMs: 999_999 })).toThrow(/waitForTimeoutMs/u)
+  })
+
+  it('accepts a custom notifyAppId', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, notifyAppId: 'MyApp' })
+    expect(resolved.notifyAppId).toBe('MyApp')
+  })
+
+  it('rejects an empty notifyAppId', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, notifyAppId: '' })).toThrow(/notifyAppId/u)
+  })
+
+  it('rejects an out-of-range maxMultiActionSteps', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxMultiActionSteps: 0 })).toThrow(/maxMultiActionSteps/u)
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxMultiActionSteps: 101 })).toThrow(/maxMultiActionSteps/u)
   })
 })
 

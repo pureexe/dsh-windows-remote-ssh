@@ -53,6 +53,39 @@ export const MAX_TEXT_LENGTH = 10_000
 // every character here is a character a long %TEMP% path can't spend.
 export const DEFAULT_REMOTE_WORKDIR = 'dsh-rssh'
 
+export const DEFAULT_POWERSHELL_TIMEOUT_MS = 30_000
+export const MAX_POWERSHELL_TIMEOUT_MS = 600_000
+export const DEFAULT_MAX_POWERSHELL_OUTPUT_LENGTH = 20_000
+export const MAX_POWERSHELL_OUTPUT_LENGTH = 200_000
+
+/** Default cap on one filesystem_pull/filesystem_push transfer (10 MB). */
+export const DEFAULT_MAX_FILESYSTEM_TRANSFER_BYTES = 10_000_000
+/** Ceiling on the transfer cap (100 MB) — SFTP over the SSH link, not a fast local copy. */
+export const MAX_FILESYSTEM_TRANSFER_BYTES = 100_000_000
+/** Default cap on inlining a pulled file's bytes as text/base64 in the tool result, above which it's saved as an attachment instead. */
+export const DEFAULT_MAX_INLINE_FILESYSTEM_BYTES = 100_000
+
+/** Default `wait_for` poll timeout (10s): long enough for a typical app to open/settle, short enough not to tie up a tool call indefinitely. */
+export const DEFAULT_WAIT_FOR_TIMEOUT_MS = 10_000
+/** Floor on a `wait_for` timeout — below this the ~500ms poll interval barely gets one iteration in. */
+export const MIN_WAIT_FOR_TIMEOUT_MS = 500
+/** Ceiling on a `wait_for` timeout (2 minutes) — long enough for slow app startup without one tool call blocking indefinitely. */
+export const MAX_WAIT_FOR_TIMEOUT_MS = 120_000
+
+/**
+ * Default AUMID `notify` targets when no `appId` is given: the well-known
+ * built-in Windows PowerShell App User Model ID. Toasting through it is the
+ * standard community technique for showing a real Action Center notification
+ * from PowerShell without registering a new app on the target — it works out
+ * of the box on stock Windows 10/11.
+ */
+export const DEFAULT_NOTIFY_APP_ID = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
+
+/** Default cap on the number of sub-actions one `multi_action` call may batch. */
+export const DEFAULT_MAX_MULTI_ACTION_STEPS = 20
+/** Ceiling on `maxMultiActionSteps` — a single tool call staying bounded, not a substitute for a real scripting loop. */
+export const MAX_MULTI_ACTION_STEPS = 100
+
 /** SSH connection parameters for the remote Windows host. */
 export interface SshConfig {
   /** Hostname or IP; falls back to env `SSH_HOST`. */
@@ -134,6 +167,51 @@ export interface Config {
   maxTextLength?: number
   /** Back up and restore control text when `type` fails (default true). */
   rollbackEnabled?: boolean
+  /**
+   * Register the `powershell` tool, which runs an arbitrary script on the
+   * remote host with full user privileges — not scoped to any window, not
+   * sandboxed beyond the account's own permissions (default false: this is
+   * categorically more powerful than every other tool this plugin
+   * registers, and must be opted into deliberately). Still gated by
+   * approval like any other mutating action when enabled.
+   */
+  enablePowerShellTool?: boolean
+  /** Per-`powershell`-call timeout in milliseconds, independent of `helperTimeoutMs` since scripts may legitimately run longer (default 30000). */
+  powerShellTimeoutMs?: number
+  /** Cap on stdout/stderr length one `powershell` call returns, each truncated independently (default 20000). */
+  maxPowerShellOutputLength?: number
+  /**
+   * Cap on one `filesystem_pull`/`filesystem_push` transfer in bytes (default
+   * 10000000, i.e. 10 MB). A pull of a larger remote file, or a push of
+   * larger content, is refused outright rather than silently truncated —
+   * truncating binary content would just corrupt it.
+   */
+  maxFilesystemTransferBytes?: number
+  /**
+   * Above this many bytes, `filesystem_pull` saves the file as an attachment
+   * (image or generic file) instead of inlining it as text/base64 in the
+   * tool result (default 100000). Keeps a merely-large-but-under-the-transfer-cap
+   * text file from bloating the model's context.
+   */
+  maxInlineFilesystemBytes?: number
+  /**
+   * Default timeout in milliseconds for `wait_for` when the call doesn't
+   * supply its own (default 10000; bounded 500..120000). `wait_for` polls
+   * roughly every 500ms until its condition is met or this elapses.
+   */
+  waitForTimeoutMs?: number
+  /**
+   * Default AUMID `notify` toasts under when a call doesn't supply its own
+   * `appId` (default the well-known built-in Windows PowerShell AUMID, which
+   * works on stock Windows 10/11 with no app registration).
+   */
+  notifyAppId?: string
+  /**
+   * Cap on the number of sub-actions one `multi_action` call may batch
+   * (default 20, max 100) — a single tool call staying bounded, not a
+   * substitute for a real scripting loop.
+   */
+  maxMultiActionSteps?: number
 }
 
 /** Fully resolved configuration captured at plugin load. */
@@ -160,6 +238,14 @@ export interface ResolvedConfig {
   maxTreeDepth: number
   maxTextLength: number
   rollbackEnabled: boolean
+  enablePowerShellTool: boolean
+  powerShellTimeoutMs: number
+  maxPowerShellOutputLength: number
+  maxFilesystemTransferBytes: number
+  maxInlineFilesystemBytes: number
+  waitForTimeoutMs: number
+  notifyAppId: string
+  maxMultiActionSteps: number
 }
 
 /** Schemastery schema for loader-validated configuration. */
@@ -190,6 +276,14 @@ export const Config: z<Config> = z.object({
   maxTreeDepth: z.number().min(1).max(MAX_TREE_DEPTH).default(DEFAULT_MAX_TREE_DEPTH),
   maxTextLength: z.number().min(16).max(MAX_TEXT_LENGTH).default(DEFAULT_MAX_TEXT_LENGTH),
   rollbackEnabled: z.boolean().default(true),
+  enablePowerShellTool: z.boolean().default(false),
+  powerShellTimeoutMs: z.number().min(1).max(MAX_POWERSHELL_TIMEOUT_MS).default(DEFAULT_POWERSHELL_TIMEOUT_MS),
+  maxPowerShellOutputLength: z.number().min(1).max(MAX_POWERSHELL_OUTPUT_LENGTH).default(DEFAULT_MAX_POWERSHELL_OUTPUT_LENGTH),
+  maxFilesystemTransferBytes: z.number().min(1).max(MAX_FILESYSTEM_TRANSFER_BYTES).default(DEFAULT_MAX_FILESYSTEM_TRANSFER_BYTES),
+  maxInlineFilesystemBytes: z.number().min(1).max(MAX_FILESYSTEM_TRANSFER_BYTES).default(DEFAULT_MAX_INLINE_FILESYSTEM_BYTES),
+  waitForTimeoutMs: z.number().min(MIN_WAIT_FOR_TIMEOUT_MS).max(MAX_WAIT_FOR_TIMEOUT_MS).default(DEFAULT_WAIT_FOR_TIMEOUT_MS),
+  notifyAppId: z.string().default(DEFAULT_NOTIFY_APP_ID),
+  maxMultiActionSteps: z.number().min(1).max(MAX_MULTI_ACTION_STEPS).default(DEFAULT_MAX_MULTI_ACTION_STEPS),
 })
 
 /** Throw the standard fail-loud config error for one invalid field. */
@@ -458,6 +552,42 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
   const rollbackEnabled = config?.rollbackEnabled ?? true
   if (typeof rollbackEnabled !== 'boolean') invalid('rollbackEnabled', 'must be a boolean')
 
+  const enablePowerShellTool = config?.enablePowerShellTool ?? false
+  if (typeof enablePowerShellTool !== 'boolean') invalid('enablePowerShellTool', 'must be a boolean')
+
+  const powerShellTimeoutMs = config?.powerShellTimeoutMs ?? DEFAULT_POWERSHELL_TIMEOUT_MS
+  if (!Number.isFinite(powerShellTimeoutMs) || powerShellTimeoutMs < 1 || powerShellTimeoutMs > MAX_POWERSHELL_TIMEOUT_MS) {
+    invalid('powerShellTimeoutMs', `must be a finite number between 1 and ${MAX_POWERSHELL_TIMEOUT_MS}`)
+  }
+
+  const maxPowerShellOutputLength = config?.maxPowerShellOutputLength ?? DEFAULT_MAX_POWERSHELL_OUTPUT_LENGTH
+  if (!Number.isInteger(maxPowerShellOutputLength) || maxPowerShellOutputLength < 1 || maxPowerShellOutputLength > MAX_POWERSHELL_OUTPUT_LENGTH) {
+    invalid('maxPowerShellOutputLength', `must be an integer between 1 and ${MAX_POWERSHELL_OUTPUT_LENGTH}`)
+  }
+
+  const maxFilesystemTransferBytes = config?.maxFilesystemTransferBytes ?? DEFAULT_MAX_FILESYSTEM_TRANSFER_BYTES
+  if (!Number.isInteger(maxFilesystemTransferBytes) || maxFilesystemTransferBytes < 1 || maxFilesystemTransferBytes > MAX_FILESYSTEM_TRANSFER_BYTES) {
+    invalid('maxFilesystemTransferBytes', `must be an integer between 1 and ${MAX_FILESYSTEM_TRANSFER_BYTES}`)
+  }
+
+  const maxInlineFilesystemBytes = config?.maxInlineFilesystemBytes ?? DEFAULT_MAX_INLINE_FILESYSTEM_BYTES
+  if (!Number.isInteger(maxInlineFilesystemBytes) || maxInlineFilesystemBytes < 1 || maxInlineFilesystemBytes > MAX_FILESYSTEM_TRANSFER_BYTES) {
+    invalid('maxInlineFilesystemBytes', `must be an integer between 1 and ${MAX_FILESYSTEM_TRANSFER_BYTES}`)
+  }
+
+  const waitForTimeoutMs = config?.waitForTimeoutMs ?? DEFAULT_WAIT_FOR_TIMEOUT_MS
+  if (!Number.isFinite(waitForTimeoutMs) || waitForTimeoutMs < MIN_WAIT_FOR_TIMEOUT_MS || waitForTimeoutMs > MAX_WAIT_FOR_TIMEOUT_MS) {
+    invalid('waitForTimeoutMs', `must be a finite number between ${MIN_WAIT_FOR_TIMEOUT_MS} and ${MAX_WAIT_FOR_TIMEOUT_MS}`)
+  }
+
+  const notifyAppId = config?.notifyAppId ?? DEFAULT_NOTIFY_APP_ID
+  if (typeof notifyAppId !== 'string' || notifyAppId.length === 0) invalid('notifyAppId', 'must be a non-empty string')
+
+  const maxMultiActionSteps = config?.maxMultiActionSteps ?? DEFAULT_MAX_MULTI_ACTION_STEPS
+  if (!Number.isInteger(maxMultiActionSteps) || maxMultiActionSteps < 1 || maxMultiActionSteps > MAX_MULTI_ACTION_STEPS) {
+    invalid('maxMultiActionSteps', `must be an integer between 1 and ${MAX_MULTI_ACTION_STEPS}`)
+  }
+
   return Object.freeze({
     ssh,
     requireApproval,
@@ -476,5 +606,13 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
     maxTreeDepth,
     maxTextLength,
     rollbackEnabled,
+    enablePowerShellTool,
+    powerShellTimeoutMs,
+    maxPowerShellOutputLength,
+    maxFilesystemTransferBytes,
+    maxInlineFilesystemBytes,
+    waitForTimeoutMs,
+    notifyAppId,
+    maxMultiActionSteps,
   })
 }

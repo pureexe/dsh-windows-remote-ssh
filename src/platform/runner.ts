@@ -23,18 +23,25 @@ import {
   expectString,
   type ActionOutcome,
   type AppInfo,
+  type CaptureOptions,
   type ClickRequest,
   type DesktopBackend,
+  type DisplayInfo,
   type ElementInfo,
   type HelperRequest,
   type HelperResponse,
   type KeyRequest,
   type LaunchOutcome,
+  type MoveRequest,
+  type PowerShellOutcome,
   type PixelHint,
+  type ProcessInfo,
+  type ProcessKillRequest,
   type Rect,
   type Screenshot,
   type ScrollRequest,
   type Tree,
+  type WindowControlRequest,
   type WindowInfo,
   type WindowRef,
   type WindowSnapshot,
@@ -77,6 +84,37 @@ function expectWindow(value: unknown, op: string): WindowInfo {
     rect: expectRect(record['rect'], op),
     executablePath,
     visible: record['visible'] !== false,
+    minimized: record['minimized'] === true,
+    maximized: record['maximized'] === true,
+  }
+}
+
+/** Validate one helper display record. */
+function expectDisplay(value: unknown, op: string): DisplayInfo {
+  const record = expectRecordValue(value, op)
+  return {
+    index: expectNumber(record, 'index', op),
+    rect: expectRect(record['rect'], op),
+    primary: record['primary'] === true,
+  }
+}
+
+/** Validate one helper process record. */
+function expectProcess(value: unknown, op: string): ProcessInfo {
+  const record = expectRecordValue(value, op)
+  const executablePath = record['executablePath']
+  if (executablePath !== null && typeof executablePath !== 'string') {
+    throw new RemoteSshError(`helper "${op}" returned malformed executablePath`, 'BAD_HELPER_RESPONSE')
+  }
+  const mainWindowTitle = record['mainWindowTitle']
+  if (mainWindowTitle !== null && typeof mainWindowTitle !== 'string') {
+    throw new RemoteSshError(`helper "${op}" returned malformed mainWindowTitle`, 'BAD_HELPER_RESPONSE')
+  }
+  return {
+    pid: expectNumber(record, 'pid', op),
+    name: expectString(record, 'name', op),
+    executablePath,
+    mainWindowTitle,
   }
 }
 
@@ -368,6 +406,45 @@ export class SshHelperBackend {
       }
     }
   }
+
+  /**
+   * Download one file's exact bytes over SFTP. Plain file I/O — no helper,
+   * no Scheduled Task, since SFTP doesn't need the interactive session. Stats
+   * the file first and refuses outright over `maxFilesystemTransferBytes`
+   * rather than reading a potentially huge file just to reject it after.
+   */
+  async pullFile(target: ResolvedSshConfig, remotePath: string): Promise<Buffer> {
+    const { ssh } = this.connectionFor(target)
+    const size = await ssh.statSize(remotePath)
+    if (size > this.config.maxFilesystemTransferBytes) {
+      throw new RemoteSshError(
+        `${remotePath} is ${size} bytes, over the maxFilesystemTransferBytes cap (${this.config.maxFilesystemTransferBytes})`,
+        'FILE_TOO_LARGE',
+      )
+    }
+    return ssh.readFile(remotePath)
+  }
+
+  /**
+   * Upload exact bytes to one remote path over SFTP, optionally creating
+   * missing parent directories first. Refuses outright over
+   * `maxFilesystemTransferBytes` — truncating would just corrupt the upload.
+   */
+  async pushFile(target: ResolvedSshConfig, remotePath: string, data: Buffer, createDirectories: boolean): Promise<{ bytesWritten: number }> {
+    if (data.length > this.config.maxFilesystemTransferBytes) {
+      throw new RemoteSshError(
+        `refusing to write ${data.length} bytes to ${remotePath}: over the maxFilesystemTransferBytes cap (${this.config.maxFilesystemTransferBytes})`,
+        'FILE_TOO_LARGE',
+      )
+    }
+    const { ssh } = this.connectionFor(target)
+    if (createDirectories) {
+      const dir = remotePath.slice(0, Math.max(remotePath.lastIndexOf('\\'), remotePath.lastIndexOf('/')))
+      if (dir.length > 0) await ssh.ensureRemoteDir(dir)
+    }
+    await ssh.writeFile(remotePath, data)
+    return { bytesWritten: data.length }
+  }
 }
 
 /** A {@link DesktopBackend} bound to one resolved SSH target, backed by a shared {@link SshHelperBackend} pool. */
@@ -387,13 +464,15 @@ class TargetedBackend implements DesktopBackend {
     return result.map(item => expectWindow(item, 'windows'))
   }
 
-  async shot(ref: WindowRef, maxSide: number, wholeScreen: boolean, signal?: AbortSignal): Promise<Screenshot> {
+  async shot(ref: WindowRef, maxSide: number, wholeScreen: boolean, capture?: CaptureOptions, signal?: AbortSignal): Promise<Screenshot> {
     const result = await this.pool.invoke(this.target, 'shot', {
       target: ref,
       maxSide,
       wholeScreen,
       maxElements: this.config.maxElements,
       maxDepth: this.config.maxTreeDepth,
+      ...capture?.region !== undefined ? { region: capture.region } : {},
+      ...capture?.display !== undefined ? { display: capture.display } : {},
     }, signal)
     const record = expectRecordValue(result, 'shot')
     return {
@@ -448,6 +527,16 @@ class TargetedBackend implements DesktopBackend {
     return expectActionOutcome(result, 'key')
   }
 
+  async move(request: MoveRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome> {
+    const result = await this.pool.invoke(this.target, 'move', { request, focusFallback }, signal)
+    return expectActionOutcome(result, 'move')
+  }
+
+  async windowControl(request: WindowControlRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome> {
+    const result = await this.pool.invoke(this.target, 'windowControl', { request, focusFallback }, signal)
+    return expectActionOutcome(result, 'windowControl')
+  }
+
   async apps(signal?: AbortSignal): Promise<AppInfo[]> {
     const result = await this.pool.invoke(this.target, 'apps', {}, signal)
     if (!Array.isArray(result)) throw new RemoteSshError('helper "apps" returned a non-array result', 'BAD_HELPER_RESPONSE')
@@ -479,5 +568,66 @@ class TargetedBackend implements DesktopBackend {
       processId: expectNumber(record, 'processId', 'launch'),
       executablePath,
     }
+  }
+
+  async powershell(script: string, timeoutMs: number, signal?: AbortSignal): Promise<PowerShellOutcome> {
+    const result = await this.pool.invoke(this.target, 'powershell', {
+      script,
+      timeoutMs,
+      maxOutputLength: this.config.maxPowerShellOutputLength,
+    }, signal)
+    const record = expectRecordValue(result, 'powershell')
+    return {
+      exitCode: expectNumber(record, 'exitCode', 'powershell'),
+      stdout: expectString(record, 'stdout', 'powershell'),
+      stderr: expectString(record, 'stderr', 'powershell'),
+      truncated: record['truncated'] === true,
+    }
+  }
+
+  async pullFile(remotePath: string): Promise<Buffer> {
+    return this.pool.pullFile(this.target, remotePath)
+  }
+
+  async pushFile(remotePath: string, data: Buffer, createDirectories: boolean): Promise<{ bytesWritten: number }> {
+    return this.pool.pushFile(this.target, remotePath, data, createDirectories)
+  }
+
+  async clipboardGet(signal?: AbortSignal): Promise<string> {
+    const result = await this.pool.invoke(this.target, 'clipboard', { action: 'get' }, signal)
+    const record = expectRecordValue(result, 'clipboard')
+    return expectString(record, 'text', 'clipboard')
+  }
+
+  async clipboardSet(text: string, signal?: AbortSignal): Promise<void> {
+    await this.pool.invoke(this.target, 'clipboard', { action: 'set', text }, signal)
+  }
+
+  async processList(signal?: AbortSignal): Promise<ProcessInfo[]> {
+    const result = await this.pool.invoke(this.target, 'process', { action: 'list' }, signal)
+    const record = expectRecordValue(result, 'process')
+    const processes = record['processes']
+    if (!Array.isArray(processes)) throw new RemoteSshError('helper "process" returned a non-array processes field', 'BAD_HELPER_RESPONSE')
+    return processes.map(item => expectProcess(item, 'process'))
+  }
+
+  async processKill(request: ProcessKillRequest, signal?: AbortSignal): Promise<{ killedPids: number[] }> {
+    const result = await this.pool.invoke(this.target, 'process', { action: 'kill', ...request }, signal)
+    const record = expectRecordValue(result, 'process')
+    const killedPids = record['killedPids']
+    if (!Array.isArray(killedPids) || killedPids.some(item => typeof item !== 'number')) {
+      throw new RemoteSshError('helper "process" returned a non-numeric-array killedPids field', 'BAD_HELPER_RESPONSE')
+    }
+    return { killedPids: killedPids as number[] }
+  }
+
+  async displays(signal?: AbortSignal): Promise<DisplayInfo[]> {
+    const result = await this.pool.invoke(this.target, 'displays', {}, signal)
+    if (!Array.isArray(result)) throw new RemoteSshError('helper "displays" returned a non-array result', 'BAD_HELPER_RESPONSE')
+    return result.map(item => expectDisplay(item, 'displays'))
+  }
+
+  async notify(title: string, message: string, appId: string, signal?: AbortSignal): Promise<void> {
+    await this.pool.invoke(this.target, 'notify', { title, message, appId }, signal)
   }
 }

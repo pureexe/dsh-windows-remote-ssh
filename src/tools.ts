@@ -1,31 +1,51 @@
 /**
- * The seven model tools dsh-windows-remote-ssh registers: two observers
- * (`screen_shot`, `screen_read`), four window-scoped actions (`click`,
- * `type`, `scroll`, `key`), and two application tools (`app_list`,
- * `app_launch`) — all executed on a remote Windows host over SSH. Observers
- * are read-only; every action crosses {@link ActionExecutor} — freshness
- * check, approval gate, process-identity check — before anything happens on
- * the remote desktop. Tool outputs are canonical JSON plus a pure text
- * renderer; `screen_shot` additionally emits an image content block whenever
- * `imageMode` allows one (default: always) — the harness's own attachment
- * and prompt-assembly pipeline is what adapts an image to what the current
- * model route actually accepts, so this plugin does not try to guess that
- * itself.
+ * The model tools dsh-windows-remote-ssh registers:
+ *
+ * - Pure observers, never gated: `screen_shot`, `screen_read`, `app_list`,
+ *   `display_list`, `wait_for` (polls, but never mutates), `clipboard`
+ *   `action: 'get'`, `process` `action: 'list'`.
+ * - Window-scoped mutating actions, gated by approval and crossing
+ *   {@link ActionExecutor}'s freshness/process-identity checks: `click`,
+ *   `type`, `scroll`, `key`, `move`, `multi_action`, `window_control`.
+ * - No-window mutating actions, gated by approval against a descriptive
+ *   subject instead of a cited observation: `app_launch`, `filesystem_pull`,
+ *   `filesystem_push`, `clipboard` `action: 'set'`, `process` `action:
+ *   'kill'`, `notify`.
+ * - `powershell`, an unscoped escape hatch registered only when
+ *   `enablePowerShellTool` is on (default off).
+ *
+ * All execute on a remote Windows host over SSH. Tool outputs are canonical
+ * JSON plus a pure text renderer; `screen_shot` (and `filesystem_pull`, for
+ * an image file) emit an image content block whenever `imageMode` allows one
+ * (default: always) — the harness's own attachment and prompt-assembly
+ * pipeline is what adapts an image to what the current model route actually
+ * accepts, so this plugin does not try to guess that itself.
  *
  * @module dsh-windows-remote-ssh/tools
  */
 
+import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
-import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentStore, FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ActionExecutor } from './actions.ts'
-import { resolveSshTarget, type ResolvedConfig, type ResolvedSshConfig, type SshConfig } from './config.ts'
+import { MAX_WAIT_FOR_TIMEOUT_MS, MIN_WAIT_FOR_TIMEOUT_MS, resolveSshTarget, type ResolvedConfig, type ResolvedSshConfig, type SshConfig } from './config.ts'
 import { appendAuditEvent, OBSERVED_EVENT, type ObservedEvent } from './events.ts'
+import { detectImageMediaType, looksLikeText } from './filesystem.ts'
 import { ObservationStore } from './observe.ts'
-import { sanitizePath, sanitizeVisible } from './sanitize.ts'
+import { redactSensitive, sanitizePath, sanitizeVisible } from './sanitize.ts'
+import { elementMatches, windowMatches } from './wait.ts'
 import type { DesktopBackend, ElementInfo, PixelHint, Rect, WindowInfo, WindowRef, WindowSnapshot } from './platform/types.ts'
+
+/** Resolve after `ms`, or immediately once `signal` aborts — the `wait_for` poll cadence. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+  })
+}
 
 /** Everything one tool needs at runtime; injected by `src/index.ts`. */
 export interface ToolServices {
@@ -125,6 +145,8 @@ function observedWindowInfo(info: WindowInfo, maxTextLength: number) {
     rect: info.rect,
     executablePath: info.executablePath === null ? null : sanitizePath(info.executablePath, maxTextLength),
     visible: info.visible,
+    minimized: info.minimized,
+    maximized: info.maximized,
   }
 }
 
@@ -165,12 +187,12 @@ export function screenShotTool(services: ToolServices) {
   return defineTool({
     name: 'screen_shot',
     description:
-      'Capture a screenshot of a window on the remote Windows host reachable over SSH: the addressed window, or the current foreground window when no target is given (matching screen_read). Pass wholeScreen: true to instead capture the entire primary screen (ignores target) — that capture has no single owning window, so its windowId is 0 and cannot be used as a basedOn target for click/type/scroll/key afterward; use it only to look at multiple windows/the desktop at once. Returns an observationId that later actions cite in `basedOn`. The result includes the image (unless the plugin is configured with imageMode: "text", in which case it includes only a text description). Read-only: never needs approval.',
+      'Capture a screenshot of a window on the remote Windows host reachable over SSH: the addressed window, or the current foreground window when no target is given (matching screen_read). Pass wholeScreen: true to instead capture the entire primary screen (ignores target) — that capture has no single owning window, so its windowId is 0 and cannot be used as a basedOn target for click/type/scroll/key afterward; use it only to look at multiple windows/the desktop at once. With wholeScreen: true, pass display: N (from display_list) to capture a specific monitor instead of the primary one. Pass region: {left, top, right, bottom} (absolute screen coordinates, from display_list/app_list/screen_read) to capture exactly that rectangle instead — takes precedence over target/wholeScreen/display. Returns an observationId that later actions cite in `basedOn` (region/display captures are not a valid basedOn target, same as wholeScreen). The result includes the image (unless the plugin is configured with imageMode: "text", in which case it includes only a text description). Read-only: never needs approval.',
     parameters: {
       ...sshOverrideParameter,
       target: {
         type: 'object',
-        description: 'Which window to capture (windowId, windowTitle, or processId); omitted = the current foreground window. Ignored when wholeScreen is true.',
+        description: 'Which window to capture (windowId, windowTitle, or processId); omitted = the current foreground window. Ignored when wholeScreen or region is given.',
         properties: {
           windowId: { type: 'integer', description: 'Native window handle from app_list or screen_read.' },
           windowTitle: { type: 'string', description: 'Visible window title (matched case-insensitively by substring).' },
@@ -178,7 +200,19 @@ export function screenShotTool(services: ToolServices) {
         },
         additionalProperties: false,
       },
-      wholeScreen: { type: 'boolean', description: 'Capture the entire primary screen instead of one window (default false). The result cannot be used as a basedOn target for a later action.' },
+      wholeScreen: { type: 'boolean', description: 'Capture the entire primary screen (or, with display, one specific monitor) instead of one window (default false). The result cannot be used as a basedOn target for a later action.' },
+      display: { type: 'integer', description: 'Monitor index from display_list; only applies when wholeScreen is true. Omitted = the primary screen.' },
+      region: {
+        type: 'object',
+        description: 'Capture exactly this screen-space rectangle instead of a window/whole screen (absolute coordinates). Takes precedence over target/wholeScreen/display. The result cannot be used as a basedOn target for a later action.',
+        properties: {
+          left: { type: 'integer', required: true as const },
+          top: { type: 'integer', required: true as const },
+          right: { type: 'integer', required: true as const },
+          bottom: { type: 'integer', required: true as const },
+        },
+        additionalProperties: false,
+      },
       maxSide: { type: 'integer', description: 'Longest side in pixels; larger captures are downscaled.' },
     },
     output: {
@@ -244,14 +278,24 @@ export function screenShotTool(services: ToolServices) {
     },
     timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
     async execute(args, exec) {
-      const parsed = args as { target?: WindowRef; maxSide?: number; wholeScreen?: boolean; ssh?: SshConfig }
+      const parsed = args as {
+        target?: WindowRef
+        maxSide?: number
+        wholeScreen?: boolean
+        display?: number
+        region?: { left: number; top: number; right: number; bottom: number }
+        ssh?: SshConfig
+      }
       const target = parsed.target ?? {}
       const wholeScreen = parsed.wholeScreen === true
       const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
       const backend = getBackend(sshTarget)
       const requestedSide = parsed.maxSide
       const maxSide = requestedSide === undefined ? config.maxScreenshotSide : Math.min(requestedSide, config.maxScreenshotSide)
-      const shot = await backend.shot(target, maxSide, wholeScreen, exec.signal)
+      const shot = await backend.shot(target, maxSide, wholeScreen, {
+        ...parsed.region !== undefined ? { region: parsed.region } : {},
+        ...parsed.display !== undefined ? { display: parsed.display } : {},
+      }, exec.signal)
       const sanitized = observedWindow(shot.snapshot, config.maxTextLength)
       const record = observations.record(shot.snapshot, sshTarget)
       const description = shotDescription(sanitized, shot.width, shot.height)
@@ -783,6 +827,8 @@ export function appListTool(services: ToolServices) {
                       },
                       executablePath: { oneOf: [{ type: 'string' }, { type: 'null' }] },
                       visible: { type: 'boolean' },
+                      minimized: { type: 'boolean' },
+                      maximized: { type: 'boolean' },
                     },
                     additionalProperties: false,
                   },
@@ -872,6 +918,1104 @@ export function appLaunchTool(services: ToolServices) {
   })
 }
 
+/**
+ * `powershell` — run an arbitrary script on the remote host with full user
+ * privileges. Not scoped to any window, not sandboxed beyond the account's
+ * own permissions: this is the "break glass" tool for whatever the
+ * structured window/element tools above can't reach. Only registered when
+ * `enablePowerShellTool` is on (default off); always gated by approval like
+ * every other mutating action.
+ */
+export function powershellTool(services: ToolServices) {
+  const { config, actions } = services
+  return defineTool({
+    name: 'powershell',
+    description:
+      'Run an arbitrary PowerShell script on the remote Windows host, with the full privileges of the connected user - not scoped to any window or element, and not sandboxed beyond what that account can already do. Use this only when screen_shot/screen_read/click/type/scroll/key/app_list/app_launch genuinely cannot accomplish the task (e.g. reading/writing files, querying system state, managing services, registry access). Requires approval unless requireApproval is off. Returns stdout, stderr, and the exit code; output longer than the configured cap is truncated.',
+    parameters: {
+      ...sshOverrideParameter,
+      script: { type: 'string', description: 'The PowerShell script/command(s) to run on the remote host.', required: true as const },
+      timeoutMs: { type: 'integer', description: 'Timeout for this script in milliseconds (default from plugin config; the process is killed if it runs longer).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          exitCode: { type: 'integer' },
+          stdout: { type: 'string' },
+          stderr: { type: 'string' },
+          truncated: { type: 'boolean' },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { exitCode: number; stdout: string; stderr: string; truncated: boolean }
+        const lines = [
+          `powershell exited ${result.exitCode}${result.truncated ? ' (output truncated)' : ''}`,
+          result.stdout.length > 0 ? `stdout:\n${result.stdout}` : 'stdout: (empty)',
+          result.stderr.length > 0 ? `stderr:\n${result.stderr}` : 'stderr: (empty)',
+        ]
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: config.powerShellTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as { script: string; timeoutMs?: number; ssh?: SshConfig }
+      if (parsed.script.trim() === '') {
+        throw new Error('powershell script must not be empty')
+      }
+      const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
+      const timeoutMs = parsed.timeoutMs ?? config.powerShellTimeoutMs
+      const outcome = await actions.runPowerShell(exec, parsed.script, sshTarget, timeoutMs)
+      return {
+        ok: true,
+        exitCode: outcome.exitCode,
+        stdout: redactSensitive(outcome.stdout),
+        stderr: redactSensitive(outcome.stderr),
+        truncated: outcome.truncated,
+      }
+    },
+  })
+}
+
+/**
+ * `filesystem_pull` — download one file from the remote host to the machine
+ * running the harness. An image comes back as a real image attachment
+ * (visible to the model, same mechanism `screen_shot` uses); small text
+ * comes back inline as a string; anything else is stored as a generic file
+ * attachment `filesystem_push` can write straight back. Gated by approval
+ * like a mutating action (not a free "observer" like `screen_shot`/
+ * `screen_read`): reading an arbitrary path can expose content the operator
+ * never put on screen.
+ */
+export function filesystemPullTool(services: ToolServices) {
+  const { ctx, config, actions } = services
+  return defineTool({
+    name: 'filesystem_pull',
+    description:
+      'Download one file from the remote Windows host to the machine running the harness, so it can be inspected here. An image comes back as an image attachment (visible directly); small text comes back inline as a string; anything else (large, or not text) is stored as a file attachment — cite the returned reference in filesystem_push to write it back unchanged. Requires approval unless requireApproval is off.',
+    parameters: {
+      ...sshOverrideParameter,
+      remotePath: { type: 'string', description: 'Full path to the file on the remote host, e.g. C:\\Users\\me\\Desktop\\photo.png.', required: true as const },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          remotePath: { type: 'string' },
+          sizeBytes: { type: 'integer' },
+          kind: { type: 'string', enum: ['text', 'base64', 'image', 'file'] as const },
+          content: { type: 'string', description: 'Present for kind "text" (UTF-8) and kind "base64".' },
+          image: {
+            type: 'object',
+            properties: {
+              attachmentId: { type: 'string' },
+              mediaType: { type: 'string' },
+              bytes: { type: 'integer' },
+              width: { type: 'integer' },
+              height: { type: 'integer' },
+              name: { type: 'string' },
+            },
+            additionalProperties: false,
+          },
+          file: {
+            type: 'object',
+            properties: {
+              attachmentId: { type: 'string' },
+              name: { type: 'string' },
+              bytes: { type: 'integer' },
+            },
+            additionalProperties: false,
+          },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as {
+          remotePath: string
+          sizeBytes: number
+          kind: 'text' | 'base64' | 'image' | 'file'
+          content?: string
+          image?: ImageAttachmentRef
+          file?: FileAttachmentRef
+        }
+        if (result.kind === 'image' && result.image !== undefined) {
+          return [
+            { type: 'text', text: `Pulled ${result.remotePath} (${result.sizeBytes} bytes) as an image attachment.` },
+            { type: 'image', attachment: result.image },
+          ]
+        }
+        if (result.kind === 'file' && result.file !== undefined) {
+          return [{
+            type: 'text',
+            text: `Pulled ${result.remotePath} (${result.sizeBytes} bytes) as a file attachment "${result.file.name}" (attachmentId ${result.file.attachmentId}) — cite this exact reference in filesystem_push's \`file\` argument to write it back unchanged.`,
+          }]
+        }
+        if (result.kind === 'base64') {
+          return [{ type: 'text', text: `Pulled ${result.remotePath} (${result.sizeBytes} bytes, base64 below — no attachment store is mounted to hold it as a file):\n${result.content ?? ''}` }]
+        }
+        return [{ type: 'text', text: `Pulled ${result.remotePath} (${result.sizeBytes} bytes) as text:\n${result.content ?? ''}` }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 30_000,
+    async execute(args, exec) {
+      const parsed = args as { remotePath: string; ssh?: SshConfig }
+      const remotePath = parsed.remotePath.trim()
+      if (remotePath === '') {
+        throw new Error('filesystem_pull remotePath must not be empty')
+      }
+      const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
+      const data = await actions.pullFile(exec, remotePath, sshTarget)
+      const name = path.win32.basename(remotePath) || 'file'
+      const attachments = ctx.get('attachments') as AttachmentStore | undefined
+
+      const imageMediaType = detectImageMediaType(data)
+      if (imageMediaType !== undefined && attachments !== undefined) {
+        try {
+          const image = await attachments.saveImage({ data, mediaType: imageMediaType, name })
+          return { ok: true, remotePath, sizeBytes: data.length, kind: 'image' as const, image }
+        } catch {
+          // Rejected by image validation (corrupt/oversized/policy) — fall through to generic handling below.
+        }
+      }
+
+      if (data.length <= config.maxInlineFilesystemBytes && looksLikeText(data)) {
+        return { ok: true, remotePath, sizeBytes: data.length, kind: 'text' as const, content: data.toString('utf8') }
+      }
+
+      if (attachments !== undefined) {
+        const file = await attachments.saveFile({ data, name })
+        return { ok: true, remotePath, sizeBytes: data.length, kind: 'file' as const, file }
+      }
+
+      // No attachment store mounted and this isn't small inline-able text:
+      // return it as base64 rather than silently dropping the content.
+      return { ok: true, remotePath, sizeBytes: data.length, kind: 'base64' as const, content: data.toString('base64') }
+    },
+  })
+}
+
+/**
+ * `filesystem_push` — upload a file to the remote host: literal text/base64
+ * content, or an attachment reference (image or generic file) re-supplied
+ * exactly as an earlier tool (typically `filesystem_pull`) returned it, so
+ * its exact bytes get written back unchanged. Gated by approval like any
+ * other mutating action.
+ */
+export function filesystemPushTool(services: ToolServices) {
+  const { ctx, config, actions } = services
+  return defineTool({
+    name: 'filesystem_push',
+    description:
+      'Upload a file to the remote Windows host: either literal text/base64 content, or an attachment reference (image or file) previously returned by filesystem_pull — re-supply that exact reference to write its bytes back unchanged. Provide exactly one of content, image, or file. Creates missing parent directories by default. Requires approval unless requireApproval is off.',
+    parameters: {
+      ...sshOverrideParameter,
+      remotePath: { type: 'string', description: 'Full destination path on the remote host.', required: true as const },
+      content: { type: 'string', description: 'Literal content to write. Provide exactly one of content, image, or file.' },
+      encoding: { type: 'string', enum: ['text', 'base64'] as const, description: 'How to interpret `content` (default text = UTF-8).' },
+      image: {
+        type: 'object',
+        description: 'An image attachment reference exactly as returned by filesystem_pull (or another tool), re-supplied to write its exact bytes back.',
+        properties: {
+          attachmentId: { type: 'string', required: true as const },
+          mediaType: { type: 'string', required: true as const },
+          bytes: { type: 'integer', required: true as const },
+          width: { type: 'integer', required: true as const },
+          height: { type: 'integer', required: true as const },
+          name: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      file: {
+        type: 'object',
+        description: 'A file attachment reference exactly as returned by filesystem_pull, re-supplied to write its exact bytes back.',
+        properties: {
+          attachmentId: { type: 'string', required: true as const },
+          name: { type: 'string', required: true as const },
+          bytes: { type: 'integer', required: true as const },
+        },
+        additionalProperties: false,
+      },
+      createDirectories: { type: 'boolean', description: 'Create missing parent directories (default true).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          remotePath: { type: 'string' },
+          bytesWritten: { type: 'integer' },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { remotePath: string; bytesWritten: number }
+        return [{ type: 'text', text: `Pushed ${result.bytesWritten} bytes to ${result.remotePath} on the remote host.` }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 30_000,
+    async execute(args, exec) {
+      const parsed = args as {
+        remotePath: string
+        content?: string
+        encoding?: 'text' | 'base64'
+        image?: ImageAttachmentRef
+        file?: FileAttachmentRef
+        createDirectories?: boolean
+        ssh?: SshConfig
+      }
+      const remotePath = parsed.remotePath.trim()
+      if (remotePath === '') {
+        throw new Error('filesystem_push remotePath must not be empty')
+      }
+      const sourceCount = [parsed.content !== undefined, parsed.image !== undefined, parsed.file !== undefined].filter(Boolean).length
+      if (sourceCount !== 1) {
+        throw new Error('filesystem_push requires exactly one of content, image, or file')
+      }
+
+      let data: Buffer
+      if (parsed.content !== undefined) {
+        data = Buffer.from(parsed.content, parsed.encoding === 'base64' ? 'base64' : 'utf8')
+      } else {
+        const attachments = ctx.get('attachments') as AttachmentStore | undefined
+        if (attachments === undefined) {
+          throw new Error(`filesystem_push: no attachment store mounted, cannot resolve the given ${parsed.image !== undefined ? 'image' : 'file'} reference`)
+        }
+        if (parsed.image !== undefined) {
+          const stored = await attachments.readImage(parsed.image, exec.signal)
+          data = Buffer.from(stored.data)
+        } else {
+          const chunks: Buffer[] = []
+          for await (const chunk of attachments.readFileStream(parsed.file as FileAttachmentRef, exec.signal)) {
+            chunks.push(Buffer.from(chunk))
+          }
+          data = Buffer.concat(chunks)
+        }
+      }
+
+      const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
+      const outcome = await actions.pushFile(exec, remotePath, data, parsed.createDirectories ?? true, sshTarget)
+      return { ok: true, remotePath, bytesWritten: outcome.bytesWritten }
+    },
+  })
+}
+
+/**
+ * `move` — mouse move and drag inside an observed window, delivered entirely
+ * as posted window messages (never the real OS cursor). See the module-level
+ * `DesktopBackend.move` doc and the README for the honest limits of
+ * posted-message drag.
+ */
+export function moveTool(services: ToolServices) {
+  const { config, actions } = services
+  return defineTool({
+    name: 'move',
+    description:
+      'Move the mouse (and, with `drag`, drag) inside an observed window on the remote Windows host, delivered entirely as posted window messages (WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP) — the real OS cursor never moves. Requires `basedOn`; fails if the remote screen changed since that observation. Honest limits: this reliably works for controls that react to simple mouse events (sliders, canvases, custom-drawn controls); it is NOT real OLE/shell drag-and-drop (e.g. dragging a file between two Explorer windows) — that needs actual SendInput-driven drag detection which posted messages cannot trigger. Requires approval unless the window is allowlisted.',
+    parameters: {
+      ...basedOnParameters,
+      target: {
+        type: 'object',
+        description: 'Exactly one of elementId or (x, y) — the starting point.',
+        properties: {
+          elementId: { type: 'string', description: 'Element id from screen_read.' },
+          x: { type: 'integer', description: 'Screen x coordinate.' },
+          y: { type: 'integer', description: 'Screen y coordinate.' },
+        },
+        additionalProperties: false,
+        required: true as const,
+      },
+      drag: {
+        type: 'object',
+        description: 'When given, drag from target to this destination instead of just moving. Exactly one of (toX, toY) or toElementId.',
+        properties: {
+          toX: { type: 'integer', description: 'Destination screen x coordinate.' },
+          toY: { type: 'integer', description: 'Destination screen y coordinate.' },
+          toElementId: { type: 'string', description: 'Destination element id from screen_read.' },
+        },
+        additionalProperties: false,
+      },
+    },
+    output: {
+      schema: actionOutputSchema(false),
+      render(_args, value): ContentBlock[] {
+        return [{ type: 'text', text: actionLine('move', value as unknown as Parameters<typeof actionLine>[1]) }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as {
+        basedOn: { observationId: string; windowId: number }
+        target: { elementId?: string; x?: number; y?: number }
+        drag?: { toX?: number; toY?: number; toElementId?: string }
+      }
+      const target = parsed.target
+      const byElement = target.elementId !== undefined
+      const byPoint = target.x !== undefined && target.y !== undefined
+      if (byElement === byPoint) {
+        throw new Error('move target must name exactly one of elementId or (x, y)')
+      }
+      let drag: { toX?: number; toY?: number; toElementId?: string } | undefined
+      if (parsed.drag !== undefined) {
+        const dragByElement = parsed.drag.toElementId !== undefined
+        const dragByPoint = parsed.drag.toX !== undefined && parsed.drag.toY !== undefined
+        if (dragByElement === dragByPoint) {
+          throw new Error('drag destination must name exactly one of toElementId or (toX, toY)')
+        }
+        drag = parsed.drag
+      }
+      const outcome = await actions.perform('move', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, (focusFallback, backend) =>
+        backend.move({
+          windowId: parsed.basedOn.windowId,
+          ...byElement ? { elementId: target.elementId as string } : { x: target.x as number, y: target.y as number },
+          ...drag !== undefined ? { drag } : {},
+        }, focusFallback, exec.signal),
+        // Same reasoning as click: elementId re-resolves by UIA RuntimeId
+        // right before acting, so the whole-window tree hash adds no safety
+        // there; a coordinate-addressed move/drag has nothing else
+        // re-verifying the target, so keep it.
+        !byElement)
+      return {
+        ok: true,
+        windowId: outcome.windowId,
+        delivered: outcome.delivered,
+        process: { before: outcome.processBefore, after: outcome.processAfter },
+        ...outcome.detail !== undefined ? { detail: outcome.detail } : {},
+      }
+    },
+  })
+}
+
+/** One `wait_for` condition's match fields, shared by every kind. */
+interface WaitForMatch {
+  name?: string
+  automationId?: string
+  controlType?: string
+  title?: string
+}
+
+/**
+ * `wait_for` — poll (~500ms) until a condition is met or a timeout elapses,
+ * then return a fresh observation (same shape as `screen_read`). Entirely a
+ * harness-side loop over the existing `tree`/`listWindows` backend calls — no
+ * new helper op. Read-only: never needs approval (it never mutates
+ * anything). A timeout is a normal, non-throwing result (`met: false,
+ * timedOut: true`) carrying whatever was last observed, not an error — the
+ * model needs to see what's actually on screen when a wait times out.
+ */
+export function waitForTool(services: ToolServices) {
+  const { config, getBackend, observations } = services
+  return defineTool({
+    name: 'wait_for',
+    description:
+      'Poll the remote Windows host roughly every 500ms until a condition is met or a timeout elapses, then return a fresh observation (same shape as screen_read) with observationId set for later actions. condition.kind "element": target names a window (windowId/windowTitle/processId) and match (name/automationId/controlType substring, at least one) names what to look for in its accessibility tree. condition.kind "window": match.title names a substring to look for across all top-level window titles. condition.kind "foreground": target names a window that must exist and be the foreground window. A timeout is NOT an error: the result carries met: false, timedOut: true, and whatever was last observed, so you can see what is actually on screen. Read-only: never needs approval.',
+    parameters: {
+      ...sshOverrideParameter,
+      condition: {
+        type: 'object',
+        description: 'What to wait for.',
+        properties: {
+          kind: { type: 'string', enum: ['element', 'window', 'foreground'] as const, description: 'Condition kind.', required: true as const },
+          target: {
+            type: 'object',
+            description: 'Which window to watch (windowId, windowTitle, or processId). Required for kind "element" and "foreground"; ignored for kind "window".',
+            properties: {
+              windowId: { type: 'integer' },
+              windowTitle: { type: 'string' },
+              processId: { type: 'integer' },
+            },
+            additionalProperties: false,
+          },
+          match: {
+            type: 'object',
+            description: 'Substring match fields (case-insensitive). kind "element": name/automationId/controlType (at least one). kind "window": title.',
+            properties: {
+              name: { type: 'string' },
+              automationId: { type: 'string' },
+              controlType: { type: 'string' },
+              title: { type: 'string' },
+            },
+            additionalProperties: false,
+          },
+        },
+        additionalProperties: false,
+        required: true as const,
+      },
+      timeoutMs: { type: 'integer', description: `Timeout in milliseconds (default ${services.config.waitForTimeoutMs}, bounded ${MIN_WAIT_FOR_TIMEOUT_MS}..${MAX_WAIT_FOR_TIMEOUT_MS}).` },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          met: { type: 'boolean' },
+          timedOut: { type: 'boolean' },
+          observationId: { type: 'string' },
+          window: {
+            type: 'object',
+            properties: {
+              windowId: { type: 'integer' },
+              processId: { type: 'integer' },
+              title: { type: 'string' },
+              className: { type: 'string' },
+              executablePath: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+              rect: {
+                type: 'object',
+                properties: {
+                  x: { type: 'integer' },
+                  y: { type: 'integer' },
+                  width: { type: 'integer' },
+                  height: { type: 'integer' },
+                },
+                additionalProperties: false,
+              },
+              foreground: { type: 'boolean' },
+            },
+            additionalProperties: false,
+          },
+          elements: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                elementId: { type: 'string' },
+                controlType: { type: 'string' },
+                name: { type: 'string' },
+                automationId: { type: 'string' },
+                rect: {
+                  type: 'object',
+                  properties: {
+                    x: { type: 'integer' },
+                    y: { type: 'integer' },
+                    width: { type: 'integer' },
+                    height: { type: 'integer' },
+                  },
+                  additionalProperties: false,
+                },
+                enabled: { type: 'boolean' },
+                patterns: { type: 'array', items: { type: 'string' } },
+              },
+              additionalProperties: false,
+            },
+          },
+          pixels: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string' },
+                x: { type: 'integer' },
+                y: { type: 'integer' },
+                color: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as {
+          met: boolean
+          timedOut: boolean
+          observationId?: string
+          window?: ObservedWindowValue
+          elements: ElementInfo[]
+        }
+        const lines = [
+          result.met ? 'wait_for: condition met.' : 'wait_for: TIMED OUT before the condition was met.',
+          result.window !== undefined ? `Last observed: ${windowLine(result.window)}` : 'No window could be observed at all.',
+          ...result.observationId !== undefined ? [`observationId: ${result.observationId}`] : [],
+          `${result.elements.length} element(s) in the last observation.`,
+        ]
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: MAX_WAIT_FOR_TIMEOUT_MS + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as {
+        condition: { kind: 'element' | 'window' | 'foreground'; target?: WindowRef; match?: WaitForMatch }
+        timeoutMs?: number
+        ssh?: SshConfig
+      }
+      const condition = parsed.condition
+      if (condition === undefined || (condition.kind !== 'element' && condition.kind !== 'window' && condition.kind !== 'foreground')) {
+        throw new Error('wait_for condition.kind must be "element", "window", or "foreground"')
+      }
+      if ((condition.kind === 'element' || condition.kind === 'foreground') && condition.target === undefined) {
+        throw new Error(`wait_for condition.kind "${condition.kind}" requires condition.target`)
+      }
+      if (condition.kind === 'window' && condition.match?.title === undefined) {
+        throw new Error('wait_for condition.kind "window" requires condition.match.title')
+      }
+      const requested = parsed.timeoutMs ?? config.waitForTimeoutMs
+      const timeoutMs = Math.min(Math.max(requested, MIN_WAIT_FOR_TIMEOUT_MS), MAX_WAIT_FOR_TIMEOUT_MS)
+      const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
+      const backend = getBackend(sshTarget)
+      const match = condition.match ?? {}
+
+      let resolvedTarget: WindowRef | undefined = condition.kind === 'window' ? undefined : condition.target
+      let met = false
+      const start = Date.now()
+      for (;;) {
+        try {
+          if (condition.kind === 'window') {
+            const windows = await backend.listWindows(exec.signal)
+            const found = windows.find(window => windowMatches({ title: window.title }, match))
+            if (found !== undefined) {
+              resolvedTarget = { windowId: found.windowId }
+              met = true
+            }
+          } else if (condition.kind === 'foreground') {
+            const tree = await backend.tree(resolvedTarget ?? {}, config.maxElements, config.maxTreeDepth, false, exec.signal)
+            met = tree.snapshot.foreground
+          } else {
+            const tree = await backend.tree(resolvedTarget ?? {}, config.maxElements, config.maxTreeDepth, false, exec.signal)
+            met = tree.elements.some(element => elementMatches(element, match))
+          }
+        } catch {
+          // The target window doesn't exist yet (or momentarily vanished) -
+          // that's "not met yet", not a hard failure; keep polling.
+          met = false
+        }
+        if (met) break
+        if (Date.now() - start >= timeoutMs) break
+        await sleep(500, exec.signal)
+      }
+
+      // Final observation, best-effort: whatever can be read right now,
+      // whether or not the condition was ever met.
+      let observationId: string | undefined
+      let window: ObservedWindowValue | undefined
+      let elements: ElementInfo[] = []
+      let pixels: PixelHint[] = []
+      try {
+        const tree = await backend.tree(resolvedTarget ?? {}, config.maxElements, config.maxTreeDepth, true, exec.signal)
+        window = observedWindow(tree.snapshot, config.maxTextLength)
+        elements = tree.elements
+        pixels = tree.pixels
+        const record = observations.record(tree.snapshot, sshTarget)
+        observationId = record.id
+        auditObservation(exec, {
+          observationId: record.id,
+          windowId: tree.snapshot.windowId,
+          processId: tree.snapshot.processId,
+          executablePath: window.executablePath,
+          windowTitle: window.title,
+          elementCount: tree.elements.length,
+        }, config.auditSessionEvents)
+      } catch {
+        // No window could be observed at all (e.g. it closed and nothing
+        // else resolves): still return a normal, non-throwing result.
+      }
+
+      return {
+        ok: true,
+        met,
+        timedOut: !met,
+        ...observationId !== undefined ? { observationId } : {},
+        ...window !== undefined ? { window } : {},
+        elements: elements.map(element => observedElement(element, config.maxTextLength)),
+        pixels: pixels.map(pixel => observedPixel(pixel, config.maxTextLength)),
+      }
+    },
+  })
+}
+
+/**
+ * `clipboard` — get/set the remote clipboard text, in the same interactive
+ * session every other operation runs in (clipboard is per-session).
+ * `action: 'get'` is a pure observer (no gate, like `app_list`/`process
+ * list`); `action: 'set'` is mutating and gated by approval like
+ * `powershell` (no window subject).
+ */
+export function clipboardTool(services: ToolServices) {
+  const { config, getBackend, actions } = services
+  return defineTool({
+    name: 'clipboard',
+    description:
+      'Get or set the remote clipboard text. action: "get" reads the current clipboard text (read-only, never needs approval). action: "set" replaces it with `text` — a mutating action, requires approval unless requireApproval is off.',
+    parameters: {
+      ...sshOverrideParameter,
+      action: { type: 'string', enum: ['get', 'set'] as const, description: 'Whether to read or write the clipboard.', required: true as const },
+      text: { type: 'string', description: 'Text to set. Required when action is "set"; ignored for "get".' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          action: { type: 'string', enum: ['get', 'set'] as const },
+          text: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { action: 'get' | 'set'; text: string }
+        return [{
+          type: 'text',
+          text: result.action === 'get'
+            ? `Remote clipboard text (${result.text.length} chars):\n${result.text}`
+            : `Set remote clipboard text (${result.text.length} chars).`,
+        }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as { action: 'get' | 'set'; text?: string; ssh?: SshConfig }
+      const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
+      if (parsed.action === 'get') {
+        const backend = getBackend(sshTarget)
+        const text = await backend.clipboardGet(exec.signal)
+        return { ok: true, action: 'get' as const, text: redactSensitive(text) }
+      }
+      if (parsed.action === 'set') {
+        if (parsed.text === undefined) throw new Error('clipboard action "set" requires text')
+        await actions.setClipboard(exec, parsed.text, sshTarget)
+        return { ok: true, action: 'set' as const, text: parsed.text }
+      }
+      throw new Error(`unknown clipboard action "${String(parsed.action)}"`)
+    },
+  })
+}
+
+/**
+ * `process` — list or kill remote processes. `action: 'list'` is a pure
+ * observer (no gate, like `app_list`); `action: 'kill'` is mutating and
+ * gated by approval like `powershell`/`clipboard set` (no window subject).
+ */
+export function processTool(services: ToolServices) {
+  const { config, getBackend, actions } = services
+  return defineTool({
+    name: 'process',
+    description:
+      'List running processes on the remote Windows host, or kill one or more by pid or by name. action: "list" is read-only (never needs approval). action: "kill" requires approval unless requireApproval is off.',
+    parameters: {
+      ...sshOverrideParameter,
+      action: { type: 'string', enum: ['list', 'kill'] as const, description: 'Whether to list or kill processes.', required: true as const },
+      pid: { type: 'integer', description: 'Process id to kill. Exactly one of pid or name is required for action "kill".' },
+      name: { type: 'string', description: 'Process name to kill (every process with this name is killed). Exactly one of pid or name is required for action "kill".' },
+      force: { type: 'boolean', description: 'Force-kill (default false).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          action: { type: 'string', enum: ['list', 'kill'] as const },
+          processes: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                pid: { type: 'integer' },
+                name: { type: 'string' },
+                executablePath: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                mainWindowTitle: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+              },
+              additionalProperties: false,
+            },
+          },
+          killedPids: { type: 'array', items: { type: 'integer' } },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as {
+          action: 'list' | 'kill'
+          processes?: Array<{ pid: number; name: string; executablePath: string | null; mainWindowTitle: string | null }>
+          killedPids?: number[]
+        }
+        if (result.action === 'list' && result.processes !== undefined) {
+          const lines = [`${result.processes.length} running process(es) on the remote host:`]
+          for (const process of result.processes) {
+            lines.push(`- pid ${process.pid} ${process.name}${process.mainWindowTitle !== null ? ` (${JSON.stringify(process.mainWindowTitle)})` : ''} — ${process.executablePath ?? 'unknown executable'}`)
+          }
+          return [{ type: 'text', text: lines.join('\n') }]
+        }
+        return [{ type: 'text', text: `Killed pid(s): ${(result.killedPids ?? []).join(', ') || '(none)'}` }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as { action: 'list' | 'kill'; pid?: number; name?: string; force?: boolean; ssh?: SshConfig }
+      const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
+      if (parsed.action === 'list') {
+        const backend = getBackend(sshTarget)
+        const processes = await backend.processList(exec.signal)
+        return {
+          ok: true,
+          action: 'list' as const,
+          processes: processes.map(process => ({
+            pid: process.pid,
+            name: sanitizeVisible(process.name, config.maxTextLength),
+            executablePath: process.executablePath === null ? null : sanitizePath(process.executablePath, config.maxTextLength),
+            mainWindowTitle: process.mainWindowTitle === null ? null : sanitizeVisible(process.mainWindowTitle, config.maxTextLength),
+          })),
+        }
+      }
+      if (parsed.action === 'kill') {
+        const byPid = parsed.pid !== undefined
+        const byName = parsed.name !== undefined && parsed.name.trim() !== ''
+        if (byPid === byName) {
+          throw new Error('process kill requires exactly one of pid or name')
+        }
+        const outcome = await actions.killProcess(exec, {
+          ...byPid ? { pid: parsed.pid as number } : { name: (parsed.name as string).trim() },
+          force: parsed.force ?? false,
+        }, sshTarget)
+        return { ok: true, action: 'kill' as const, killedPids: outcome.killedPids }
+      }
+      throw new Error(`unknown process action "${String(parsed.action)}"`)
+    },
+  })
+}
+
+/**
+ * `display_list` — enumerate every monitor on the remote desktop. Pure
+ * observer: never gated, like `app_list`.
+ */
+export function displayListTool(services: ToolServices) {
+  const { config, getBackend } = services
+  return defineTool({
+    name: 'display_list',
+    description:
+      'Enumerate every monitor on the remote Windows desktop: index, screen-space rectangle, and whether it is the primary display. Read-only: never needs approval. Use a display index with screen_shot(wholeScreen: true, display: N) to capture one specific monitor, or its rect with screen_shot(region: {...}) to capture part of it.',
+    parameters: {
+      ...sshOverrideParameter,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          displays: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                index: { type: 'integer' },
+                rect: {
+                  type: 'object',
+                  properties: {
+                    x: { type: 'integer' },
+                    y: { type: 'integer' },
+                    width: { type: 'integer' },
+                    height: { type: 'integer' },
+                  },
+                  additionalProperties: false,
+                },
+                primary: { type: 'boolean' },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { displays: Array<{ index: number; rect: Rect; primary: boolean }> }
+        const lines = [`${result.displays.length} display(s) on the remote desktop:`]
+        for (const display of result.displays) {
+          lines.push(`- display ${display.index}${display.primary ? ' (primary)' : ''}: (${display.rect.x}, ${display.rect.y}) ${display.rect.width}x${display.rect.height}`)
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as { ssh?: SshConfig }
+      const backend = getBackend(resolveSshTarget(parsed.ssh, config.ssh))
+      const displays = await backend.displays(exec.signal)
+      return { ok: true, displays }
+    },
+  })
+}
+
+/**
+ * `notify` — show a real Windows Action Center toast notification (WinRT
+ * `ToastNotificationManager`, not a legacy balloon-tip/`NotifyIcon` popup).
+ * Mutating: gated by approval like `powershell` (no window subject).
+ */
+export function notifyTool(services: ToolServices) {
+  const { config, actions } = services
+  return defineTool({
+    name: 'notify',
+    description:
+      'Show a real Windows Action Center toast notification on the remote host (WinRT ToastNotificationManager — not a legacy balloon-tip popup). Uses the built-in Windows PowerShell AUMID by default so it works out of the box with no app registration; override with appId if a specific one is needed. Requires approval unless requireApproval is off.',
+    parameters: {
+      ...sshOverrideParameter,
+      title: { type: 'string', description: 'Toast title.', required: true as const },
+      message: { type: 'string', description: 'Toast body text.', required: true as const },
+      appId: { type: 'string', description: 'AUMID to toast under (default: the plugin-configured notifyAppId, itself defaulting to the built-in Windows PowerShell AUMID).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          title: { type: 'string' },
+          message: { type: 'string' },
+          appId: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { title: string; message: string; appId: string }
+        return [{ type: 'text', text: `Showed a toast notification on the remote host (appId ${result.appId}): ${JSON.stringify(result.title)} — ${JSON.stringify(result.message)}` }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as { title: string; message: string; appId?: string; ssh?: SshConfig }
+      if (parsed.title.trim() === '') throw new Error('notify title must not be empty')
+      const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
+      const appId = parsed.appId ?? config.notifyAppId
+      await actions.notify(exec, parsed.title, parsed.message, appId, sshTarget)
+      return { ok: true, title: parsed.title, message: parsed.message, appId }
+    },
+  })
+}
+
+/** One `multi_action` sub-action, as given by the model. */
+interface MultiActionStepInput {
+  kind: 'click' | 'type'
+  elementId?: string
+  x?: number
+  y?: number
+  button?: 'left' | 'right'
+  selectionMode?: 'select' | 'add' | 'remove' | 'toggle'
+  text?: string
+}
+
+/**
+ * `multi_action` — run a batch of click/type sub-actions against ONE cited
+ * observation in a single tool call (satisfies both "multi_edit" and
+ * "multi_select" from the request). Sequential, stopping at the first
+ * failure by default; `continueOnError: true` runs every step regardless.
+ * Reuses the existing `ClickRequest`/`TypeRequest` backend calls per step —
+ * each step re-verifies its own target exactly the same way a standalone
+ * `click`/`type` call already does. `selectionMode` on a click-kind step
+ * invokes UIA's SelectionItem pattern (Select/AddToSelection/
+ * RemoveFromSelection) directly when the target supports it, falling back to
+ * a plain posted click otherwise — more reliable than synthesizing
+ * modifier-key+click combinations for list/grid multi-selection.
+ */
+export function multiActionTool(services: ToolServices) {
+  const { config, actions } = services
+  return defineTool({
+    name: 'multi_action',
+    description:
+      'Run a batch of click/type sub-actions in sequence against ONE observed window on the remote Windows host (basedOn), in a single tool call. By default stops at the first failing step; continueOnError: true runs every step regardless. Each step is addressed and validated exactly like a standalone click/type call. For list/grid multi-selection, a click-kind step may set selectionMode ("select"/"add"/"remove"/"toggle") to invoke the UIA SelectionItem pattern directly instead of posting a click, when the target element supports it. Requires approval unless the window is allowlisted (one ask covers the whole batch).',
+    parameters: {
+      ...basedOnParameters,
+      steps: {
+        type: 'array',
+        description: `Sub-actions to run in sequence against the same basedOn observation (1..${services.config.maxMultiActionSteps}).`,
+        items: {
+          type: 'object',
+          properties: {
+            kind: { type: 'string', enum: ['click', 'type'] as const, description: 'Sub-action kind.', required: true as const },
+            elementId: { type: 'string', description: 'Element id from screen_read (click or type; required for type).' },
+            x: { type: 'integer', description: 'Screen x coordinate (click only, alternative to elementId).' },
+            y: { type: 'integer', description: 'Screen y coordinate (click only, alternative to elementId).' },
+            button: { type: 'string', enum: ['left', 'right'] as const, description: 'Mouse button for a click step (default left).' },
+            selectionMode: {
+              type: 'string',
+              enum: ['select', 'add', 'remove', 'toggle'] as const,
+              description: 'Click step only: apply UIA SelectionItem Select/AddToSelection/RemoveFromSelection instead of posting a click, when supported.',
+            },
+            text: { type: 'string', description: 'Text to type (type step only, up to 10000 characters).' },
+          },
+          additionalProperties: false,
+        },
+        required: true as const,
+      },
+      continueOnError: { type: 'boolean', description: 'Run every step even after one fails (default false: stop at the first failure).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          steps: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                ok: { type: 'boolean' },
+                windowId: { type: 'integer' },
+                delivered: { type: 'string', enum: ['uia', 'posted', 'none'] as const },
+                process: {
+                  type: 'object',
+                  properties: {
+                    before: {
+                      type: 'object',
+                      properties: { pid: { type: 'integer' }, executablePath: { oneOf: [{ type: 'string' }, { type: 'null' }] } },
+                      additionalProperties: false,
+                    },
+                    after: {
+                      type: 'object',
+                      properties: { pid: { type: 'integer' }, executablePath: { oneOf: [{ type: 'string' }, { type: 'null' }] } },
+                      additionalProperties: false,
+                    },
+                  },
+                  additionalProperties: false,
+                },
+                restored: { type: 'boolean' },
+                detail: { type: 'string' },
+                error: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { steps: Array<{ ok: boolean; delivered?: string; error?: string }> }
+        const lines = [`multi_action ran ${result.steps.length} step(s):`]
+        result.steps.forEach((step, index) => {
+          lines.push(step.ok ? `- step ${index}: ok (delivered ${step.delivered})` : `- step ${index}: FAILED — ${step.error}`)
+        })
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs * Math.max(1, config.maxMultiActionSteps) + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as {
+        basedOn: { observationId: string; windowId: number }
+        steps: MultiActionStepInput[]
+        continueOnError?: boolean
+      }
+      if (!Array.isArray(parsed.steps) || parsed.steps.length === 0) {
+        throw new Error('multi_action requires at least one step')
+      }
+      if (parsed.steps.length > config.maxMultiActionSteps) {
+        throw new Error(`multi_action supports at most ${config.maxMultiActionSteps} steps per call`)
+      }
+      let anyCoordinateAddressed = false
+      const runners: Array<(focusFallback: boolean, backend: DesktopBackend) => Promise<import('./platform/types.ts').ActionOutcome>> = []
+      parsed.steps.forEach((step, index) => {
+        if (step.kind === 'click') {
+          const byElement = step.elementId !== undefined
+          const byPoint = step.x !== undefined && step.y !== undefined
+          if (byElement === byPoint) {
+            throw new Error(`multi_action step ${index}: click requires exactly one of elementId or (x, y)`)
+          }
+          if (!byElement) anyCoordinateAddressed = true
+          runners.push((focusFallback, backend) => backend.click({
+            windowId: parsed.basedOn.windowId,
+            ...byElement ? { elementId: step.elementId as string } : { x: step.x as number, y: step.y as number },
+            button: step.button ?? 'left',
+            ...step.selectionMode !== undefined ? { selectionMode: step.selectionMode } : {},
+          }, focusFallback, exec.signal))
+        } else if (step.kind === 'type') {
+          if (step.elementId === undefined) throw new Error(`multi_action step ${index}: type requires elementId`)
+          if (step.text === undefined) throw new Error(`multi_action step ${index}: type requires text`)
+          if (step.text.length > 10_000) throw new Error(`multi_action step ${index}: type text must be at most 10000 characters`)
+          runners.push((focusFallback, backend) => backend.type({
+            windowId: parsed.basedOn.windowId,
+            elementId: step.elementId as string,
+            text: step.text as string,
+            rollback: config.rollbackEnabled,
+          }, focusFallback, exec.signal))
+        } else {
+          throw new Error(`multi_action step ${index}: unknown kind "${String((step as { kind: unknown }).kind)}"`)
+        }
+      })
+      const results = await actions.performMulti(
+        'multi_action',
+        exec,
+        parsed.basedOn.observationId,
+        parsed.basedOn.windowId,
+        runners,
+        parsed.continueOnError ?? false,
+        anyCoordinateAddressed,
+      )
+      return {
+        ok: true,
+        steps: results.map((result) => {
+          if (result.ok) {
+            return {
+              ok: true as const,
+              windowId: result.outcome.windowId,
+              delivered: result.outcome.delivered,
+              process: { before: result.outcome.processBefore, after: result.outcome.processAfter },
+              ...result.outcome.restored !== undefined ? { restored: result.outcome.restored } : {},
+              ...result.outcome.detail !== undefined ? { detail: result.outcome.detail } : {},
+            }
+          }
+          return { ok: false as const, error: result.error }
+        }),
+      }
+    },
+  })
+}
+
+/**
+ * `window_control` — minimize/maximize/restore/move/resize/close a window.
+ * Mutating: gated by approval like `click`/`scroll`/`key` (window-subject
+ * pattern, participates in `autoApproveWindows`).
+ */
+export function windowControlTool(services: ToolServices) {
+  const { config, actions } = services
+  return defineTool({
+    name: 'window_control',
+    description:
+      'Minimize, maximize, restore, move, resize, or close an observed window on the remote Windows host. Requires `basedOn`; fails if the remote screen changed since that observation. Requires approval unless the window is allowlisted.',
+    parameters: {
+      ...basedOnParameters,
+      action: { type: 'string', enum: ['minimize', 'maximize', 'restore', 'move', 'resize', 'close'] as const, description: 'Window action.', required: true as const },
+      x: { type: 'integer', description: 'New screen x coordinate (action "move" only).' },
+      y: { type: 'integer', description: 'New screen y coordinate (action "move" only).' },
+      width: { type: 'integer', description: 'New width in pixels (action "resize" only).' },
+      height: { type: 'integer', description: 'New height in pixels (action "resize" only).' },
+    },
+    output: {
+      schema: actionOutputSchema(false),
+      render(_args, value): ContentBlock[] {
+        return [{ type: 'text', text: actionLine('window_control', value as unknown as Parameters<typeof actionLine>[1]) }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as {
+        basedOn: { observationId: string; windowId: number }
+        action: 'minimize' | 'maximize' | 'restore' | 'move' | 'resize' | 'close'
+        x?: number
+        y?: number
+        width?: number
+        height?: number
+      }
+      if (parsed.action === 'move' && (parsed.x === undefined || parsed.y === undefined)) {
+        throw new Error('window_control action "move" requires x and y')
+      }
+      if (parsed.action === 'resize' && (parsed.width === undefined || parsed.height === undefined)) {
+        throw new Error('window_control action "resize" requires width and height')
+      }
+      const outcome = await actions.perform('window_control', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, (focusFallback, backend) =>
+        backend.windowControl({
+          windowId: parsed.basedOn.windowId,
+          action: parsed.action,
+          ...parsed.x !== undefined ? { x: parsed.x } : {},
+          ...parsed.y !== undefined ? { y: parsed.y } : {},
+          ...parsed.width !== undefined ? { width: parsed.width } : {},
+          ...parsed.height !== undefined ? { height: parsed.height } : {},
+        }, focusFallback, exec.signal))
+      return {
+        ok: true,
+        windowId: outcome.windowId,
+        delivered: outcome.delivered,
+        process: { before: outcome.processBefore, after: outcome.processAfter },
+        ...outcome.detail !== undefined ? { detail: outcome.detail } : {},
+      }
+    },
+  })
+}
+
 /** Every tool definition, in registration order. */
 export function allTools(services: ToolServices) {
   return [
@@ -881,7 +2025,18 @@ export function allTools(services: ToolServices) {
     typeTool(services),
     scrollTool(services),
     keyTool(services),
+    moveTool(services),
+    waitForTool(services),
+    multiActionTool(services),
+    windowControlTool(services),
     appListTool(services),
     appLaunchTool(services),
+    filesystemPullTool(services),
+    filesystemPushTool(services),
+    clipboardTool(services),
+    processTool(services),
+    displayListTool(services),
+    notifyTool(services),
+    ...services.config.enablePowerShellTool ? [powershellTool(services)] : [],
   ]
 }

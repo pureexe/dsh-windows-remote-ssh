@@ -17,7 +17,12 @@ import type { ResolvedConfig, ResolvedSshConfig } from './config.ts'
 import { appendAuditEvent, ACTION_EVENT, type ActionEvent, type ProcessFacts } from './events.ts'
 import { ObservationStore, type ObservationRecord } from './observe.ts'
 import { sanitizeVisible } from './sanitize.ts'
-import { RemoteSshError, type ActionOutcome, type DesktopBackend, type LaunchOutcome, type WindowSnapshot } from './platform/types.ts'
+import { RemoteSshError, type ActionOutcome, type DesktopBackend, type LaunchOutcome, type PowerShellOutcome, type ProcessKillRequest, type WindowSnapshot } from './platform/types.ts'
+
+/** The outcome of one sub-action within a `multi_action` batch. */
+export type MultiActionStepOutcome =
+  | { ok: true; outcome: ActionOutcome }
+  | { ok: false; error: string }
 
 /** Which gate allowed an action, for the audit trail. */
 export type ApprovalKind = 'approval' | 'allowlist' | 'none'
@@ -220,6 +225,78 @@ export class ActionExecutor {
   }
 
   /**
+   * Run a batch of window-scoped mutating sub-actions (`multi_action`)
+   * against ONE cited observation, sequentially, in a single approval ask —
+   * not one ask per step. Freshness is checked once up front, exactly like
+   * {@link perform}; each step's own backend call (click/type) still
+   * re-verifies its own exact target immediately before acting the same way
+   * the standalone `click`/`type` tools already do (elementId re-resolution
+   * by UIA RuntimeId), so nothing here re-checks staleness per step. By
+   * default the first failing step stops the batch; `continueOnError: true`
+   * runs every step regardless, collecting one outcome per step either way.
+   *
+   * @param checkTree - forwarded to the one up-front freshness check, same
+   * meaning as {@link perform}'s own `checkTree`.
+   */
+  async performMulti(
+    toolName: string,
+    exec: ToolRunContext,
+    observationId: string,
+    windowId: number,
+    steps: ReadonlyArray<(focusFallback: boolean, backend: DesktopBackend) => Promise<ActionOutcome>>,
+    continueOnError: boolean,
+    checkTree = true,
+  ): Promise<MultiActionStepOutcome[]> {
+    let approved: ApprovalKind = 'none'
+    let observationIdAudited: string | undefined
+    let windowIdAudited: number | undefined
+    const results: MultiActionStepOutcome[] = []
+    try {
+      const { record } = await this.requireFreshWindow(observationId, windowId, exec.signal, checkTree)
+      observationIdAudited = observationId
+      windowIdAudited = windowId
+      approved = await this.gate(exec, toolName, {
+        title: record.title,
+        executablePath: record.executablePath,
+      }, exec.signal)
+      const backend = this.deps.getBackend(record.target)
+      const focusFallback = this.config.focusFallback === 'allow'
+      for (const step of steps) {
+        try {
+          const outcome = await step(focusFallback, backend)
+          this.assertProcessUnchanged(outcome.processBefore, outcome.processAfter)
+          results.push({ ok: true, outcome })
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error)
+          results.push({ ok: false, error: message })
+          if (!continueOnError) break
+        }
+      }
+      const succeeded = results.filter(result => result.ok).length
+      this.audit(exec, {
+        tool: toolName,
+        approved,
+        outcome: results.every(result => result.ok) ? 'ok' : 'error',
+        observationId: observationIdAudited,
+        windowId: windowIdAudited,
+        detail: `${succeeded}/${results.length} step(s) ok`,
+      })
+      return results
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.audit(exec, {
+        tool: toolName,
+        approved,
+        outcome: 'error',
+        ...observationIdAudited !== undefined ? { observationId: observationIdAudited } : {},
+        ...windowIdAudited !== undefined ? { windowId: windowIdAudited } : {},
+        detail: message,
+      })
+      throw error
+    }
+  }
+
+  /**
    * Gate and launch one application on the remote host. No window
    * observation exists yet, so the gate runs against the requested name/path
    * alone and the launch outcome's process facts are the post-identity proof.
@@ -244,6 +321,142 @@ export class ActionExecutor {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error)
       this.audit(exec, { tool: toolName, approved, outcome: 'error', detail: message })
+      throw error
+    }
+  }
+
+  /**
+   * Gate and run one arbitrary PowerShell script on the remote host. No
+   * window observation exists (this is not window-scoped at all), so the
+   * gate runs against a sanitized preview of the script itself. Categorically
+   * more powerful than every other action this executor performs — full user
+   * privileges, no window/element scoping — so it is always gated by
+   * approval on the same terms as everything else, never treated as
+   * inherently trusted.
+   *
+   * @param target - the SSH target to run on (resolved by the tool from its
+   * own call argument or the plugin's configured default).
+   */
+  async runPowerShell(exec: ToolRunContext, script: string, target: ResolvedSshConfig, timeoutMs: number): Promise<PowerShellOutcome> {
+    const toolName = 'powershell'
+    let approved: ApprovalKind = 'none'
+    try {
+      const preview = sanitizeVisible(script, this.config.maxTextLength)
+      approved = await this.gate(exec, toolName, { title: null, executablePath: preview }, exec.signal)
+      const outcome = await this.deps.getBackend(target).powershell(script, timeoutMs, exec.signal)
+      this.audit(exec, {
+        tool: toolName,
+        approved,
+        outcome: 'ok',
+        detail: `exit ${outcome.exitCode}: ${preview}`,
+      })
+      return outcome
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.audit(exec, { tool: toolName, approved, outcome: 'error', detail: message })
+      throw error
+    }
+  }
+
+  /**
+   * Gate and download one file from the remote host. Reading an arbitrary
+   * path can expose content the operator never put on screen (credentials,
+   * cached secrets, ...), so — unlike screen_shot/screen_read, which only
+   * reveal what's already visibly on screen — this is gated by approval like
+   * a mutating action, not treated as a free "observer".
+   */
+  async pullFile(exec: ToolRunContext, remotePath: string, target: ResolvedSshConfig): Promise<Buffer> {
+    const toolName = 'filesystem_pull'
+    let approved: ApprovalKind = 'none'
+    try {
+      approved = await this.gate(exec, toolName, { title: null, executablePath: remotePath }, exec.signal)
+      const data = await this.deps.getBackend(target).pullFile(remotePath, exec.signal)
+      this.audit(exec, { tool: toolName, approved, outcome: 'ok', detail: `${remotePath} (${data.length} bytes)` })
+      return data
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.audit(exec, { tool: toolName, approved, outcome: 'error', detail: message })
+      throw error
+    }
+  }
+
+  /** Gate and upload one file to the remote host. */
+  async pushFile(exec: ToolRunContext, remotePath: string, data: Buffer, createDirectories: boolean, target: ResolvedSshConfig): Promise<{ bytesWritten: number }> {
+    const toolName = 'filesystem_push'
+    let approved: ApprovalKind = 'none'
+    try {
+      approved = await this.gate(exec, toolName, { title: null, executablePath: remotePath }, exec.signal)
+      const outcome = await this.deps.getBackend(target).pushFile(remotePath, data, createDirectories, exec.signal)
+      this.audit(exec, { tool: toolName, approved, outcome: 'ok', detail: `${remotePath} (${outcome.bytesWritten} bytes)` })
+      return outcome
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.audit(exec, { tool: toolName, approved, outcome: 'error', detail: message })
+      throw error
+    }
+  }
+
+  /**
+   * Gate and set the remote clipboard's text. No window is involved (the
+   * clipboard is per-session, not per-window), so — like
+   * `runPowerShell`/`pullFile`/`pushFile` — the gate runs against a
+   * descriptive subject rather than a cited observation. `clipboard` with
+   * `action: 'get'` is a pure observer and does NOT go through this (or any)
+   * gate, the same way `app_list`/`process list`/`display_list` don't.
+   */
+  async setClipboard(exec: ToolRunContext, text: string, target: ResolvedSshConfig): Promise<void> {
+    const toolName = 'clipboard'
+    let approved: ApprovalKind = 'none'
+    try {
+      const preview = sanitizeVisible(text, this.config.maxTextLength)
+      approved = await this.gate(exec, toolName, { title: null, executablePath: `set clipboard: ${preview}` }, exec.signal)
+      await this.deps.getBackend(target).clipboardSet(text, exec.signal)
+      this.audit(exec, { tool: toolName, approved, outcome: 'ok', detail: `set clipboard (${text.length} chars)` })
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.audit(exec, { tool: toolName, approved, outcome: 'error', detail: message })
+      throw error
+    }
+  }
+
+  /**
+   * Gate and kill one or more remote processes by pid or name. No window is
+   * involved, so the gate runs against a descriptive subject the same way
+   * `runPowerShell` does. `process` with `action: 'list'` is a pure observer
+   * and does not go through this gate.
+   */
+  async killProcess(exec: ToolRunContext, request: ProcessKillRequest, target: ResolvedSshConfig): Promise<{ killedPids: number[] }> {
+    const toolName = 'process'
+    let approved: ApprovalKind = 'none'
+    try {
+      const subject = request.pid !== undefined ? `kill pid ${request.pid}` : `kill process "${sanitizeVisible(request.name ?? '', this.config.maxTextLength)}"`
+      approved = await this.gate(exec, toolName, { title: null, executablePath: subject }, exec.signal)
+      const outcome = await this.deps.getBackend(target).processKill(request, exec.signal)
+      this.audit(exec, { tool: toolName, approved, outcome: 'ok', detail: `${subject}: killed pid(s) ${outcome.killedPids.join(',') || '(none)'}` })
+      return outcome
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.audit(exec, { tool: toolName, approved, outcome: 'error', detail: message })
+      throw error
+    }
+  }
+
+  /**
+   * Gate and show one Windows Action Center toast notification on the remote
+   * host. No window is involved, so the gate runs against a descriptive
+   * subject the same way `runPowerShell` does.
+   */
+  async notify(exec: ToolRunContext, title: string, message: string, appId: string, target: ResolvedSshConfig): Promise<void> {
+    const toolName = 'notify'
+    let approved: ApprovalKind = 'none'
+    try {
+      const preview = `${sanitizeVisible(title, this.config.maxTextLength)}: ${sanitizeVisible(message, this.config.maxTextLength)}`
+      approved = await this.gate(exec, toolName, { title: null, executablePath: preview }, exec.signal)
+      await this.deps.getBackend(target).notify(title, message, appId, exec.signal)
+      this.audit(exec, { tool: toolName, approved, outcome: 'ok', detail: preview })
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      this.audit(exec, { tool: toolName, approved, outcome: 'error', detail: errorMessage })
       throw error
     }
   }

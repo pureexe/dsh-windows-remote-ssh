@@ -41,6 +41,10 @@ export interface WindowInfo {
   rect: Rect
   executablePath: string | null
   visible: boolean
+  /** Whether the window is currently minimized (`IsIconic`). */
+  minimized: boolean
+  /** Whether the window is currently maximized (`IsZoomed`). */
+  maximized: boolean
 }
 
 /** One accessibility element inside the observed window. */
@@ -101,6 +105,14 @@ export interface AppInfo {
   windows: WindowInfo[]
 }
 
+/**
+ * How a `click` step should apply UIA's SelectionItem pattern instead of
+ * posting a plain click, for list/grid-style multi-selection. Only takes
+ * effect when the addressed element actually supports the pattern; falls
+ * back to a plain click otherwise.
+ */
+export type SelectionMode = 'select' | 'add' | 'remove' | 'toggle'
+
 /** A click request: exactly one of element id or coordinates. */
 export interface ClickRequest {
   windowId: number
@@ -108,6 +120,8 @@ export interface ClickRequest {
   x?: number
   y?: number
   button: 'left' | 'right'
+  /** Use the SelectionItem pattern (Select/AddToSelection/RemoveFromSelection) instead of a plain click, when the element supports it. */
+  selectionMode?: SelectionMode
 }
 
 /** A type request addressed to a value-pattern element. */
@@ -132,6 +146,74 @@ export interface KeyRequest {
   keys: string
 }
 
+/**
+ * A mouse move (and, when `drag` is given, a drag) request, addressed the
+ * same way as `ClickRequest`. Delivered entirely as posted window messages
+ * (`WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP`) — the real OS cursor never
+ * moves. See the README for the honest limits of posted-message drag (works
+ * for controls that react to simple mouse events, e.g. sliders/canvases; NOT
+ * real OLE/shell drag-and-drop between windows).
+ */
+export interface MoveRequest {
+  windowId: number
+  elementId?: string
+  x?: number
+  y?: number
+  drag?: {
+    toX?: number
+    toY?: number
+    toElementId?: string
+  }
+}
+
+/** A window state-change request. `x`/`y` apply to `move`; `width`/`height` apply to `resize`. */
+export interface WindowControlRequest {
+  windowId: number
+  action: 'minimize' | 'maximize' | 'restore' | 'move' | 'resize' | 'close'
+  x?: number
+  y?: number
+  width?: number
+  height?: number
+}
+
+/** One display/monitor on the remote desktop, from `System.Windows.Forms.Screen.AllScreens`. */
+export interface DisplayInfo {
+  index: number
+  rect: Rect
+  primary: boolean
+}
+
+/** One running process on the remote host. */
+export interface ProcessInfo {
+  pid: number
+  name: string
+  executablePath: string | null
+  mainWindowTitle: string | null
+}
+
+/** A request to kill one or more remote processes, addressed by pid or by name. */
+export interface ProcessKillRequest {
+  pid?: number
+  name?: string
+  force?: boolean
+}
+
+/** A screen-space rectangle for a region capture, given in absolute screen coordinates. */
+export interface CaptureRegion {
+  left: number
+  top: number
+  right: number
+  bottom: number
+}
+
+/** Extra `shot` capture options layered on top of the existing window/wholeScreen addressing. Both are optional and backward compatible: omitting both behaves exactly as before. */
+export interface CaptureOptions {
+  /** Capture exactly this screen-space rectangle instead of a window/whole screen. Takes precedence over `display` when both are given. */
+  region?: CaptureRegion
+  /** With `wholeScreen: true`, capture this monitor's bounds instead of the primary screen. Ignored for a window capture. */
+  display?: number
+}
+
 /** The settled outcome of one mutating action, as reported by the helper. */
 export interface ActionOutcome {
   windowId: number
@@ -147,6 +229,15 @@ export interface ActionOutcome {
 export interface LaunchOutcome {
   processId: number
   executablePath: string | null
+}
+
+/** The settled outcome of running an arbitrary PowerShell script on the remote host. */
+export interface PowerShellOutcome {
+  exitCode: number
+  stdout: string
+  stderr: string
+  /** True when stdout and/or stderr were cut short at `maxPowerShellOutputLength`. */
+  truncated: boolean
 }
 
 /**
@@ -167,16 +258,76 @@ export interface DesktopBackend {
    * `wholeScreen: true`, `ref` is ignored and the whole primary screen is
    * captured instead (`windowId: 0`, a sentinel meaning "not one window" —
    * not a valid `basedOn` target for a later action).
+   *
+   * @param capture - optional region/display capture options (see
+   * {@link CaptureOptions}); omitted entirely, behavior is identical to
+   * before these existed. A `region` takes precedence over both `ref` and
+   * `wholeScreen`; a `display` index only applies when `wholeScreen: true`.
    */
-  shot(ref: WindowRef, maxSide: number, wholeScreen: boolean, signal?: AbortSignal): Promise<Screenshot>
+  shot(ref: WindowRef, maxSide: number, wholeScreen: boolean, capture?: CaptureOptions, signal?: AbortSignal): Promise<Screenshot>
   tree(ref: WindowRef, maxElements: number, maxDepth: number, includePixels: boolean, signal?: AbortSignal): Promise<Tree>
   snapshot(windowId: number, signal?: AbortSignal): Promise<WindowSnapshot>
   click(request: ClickRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
   type(request: TypeRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
   scroll(request: ScrollRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
   key(request: KeyRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
+  /**
+   * Move the mouse (and, with `request.drag`, drag) inside the addressed
+   * window entirely via posted window messages — the real OS cursor never
+   * moves. Honest limits: this reliably works for controls that react to
+   * simple mouse-move/button events (sliders, canvases, custom-drawn
+   * controls); it is NOT real OLE/shell drag-and-drop (e.g. dragging a file
+   * between two Explorer windows), which requires actual `SendInput`-driven
+   * drag detection that posted messages cannot trigger.
+   */
+  move(request: MoveRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
+  /** Change a window's state: minimize/maximize/restore/move/resize/close. */
+  windowControl(request: WindowControlRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
   apps(signal?: AbortSignal): Promise<AppInfo[]>
   launch(name: string, args: readonly string[], signal?: AbortSignal): Promise<LaunchOutcome>
+  /**
+   * Run an arbitrary PowerShell script on the remote host with full user
+   * privileges, in the same interactive session every other operation runs
+   * in (not sandboxed or restricted in any way beyond the account's own
+   * permissions). Only available when the plugin config explicitly enables
+   * it (`enablePowerShellTool: true`, default off) — this is categorically
+   * more powerful than every window-scoped tool and is gated by approval
+   * like any other mutating action, but is not scoped to a window at all.
+   */
+  powershell(script: string, timeoutMs: number, signal?: AbortSignal): Promise<PowerShellOutcome>
+  /**
+   * Download one file's exact bytes from the remote host over SFTP. Pure
+   * file I/O, independent of the Scheduled Task/interactive-session
+   * machinery every window-scoped operation needs — SFTP doesn't care about
+   * window stations.
+   */
+  pullFile(remotePath: string, signal?: AbortSignal): Promise<Buffer>
+  /**
+   * Upload exact bytes to one path on the remote host over SFTP, optionally
+   * creating missing parent directories first.
+   * @returns the number of bytes written (== `data.length`; included for a stable, explicit result shape).
+   */
+  pushFile(remotePath: string, data: Buffer, createDirectories: boolean, signal?: AbortSignal): Promise<{ bytesWritten: number }>
+  /**
+   * Read the remote clipboard's text, in the same interactive session every
+   * other operation runs in (clipboard is per-session, so a non-interactive
+   * exec would see a different, empty clipboard).
+   */
+  clipboardGet(signal?: AbortSignal): Promise<string>
+  /** Set the remote clipboard's text. Mutating: gated by approval like any other mutating action. */
+  clipboardSet(text: string, signal?: AbortSignal): Promise<void>
+  /** List every running process on the remote host. Pure observer: never gated. */
+  processList(signal?: AbortSignal): Promise<ProcessInfo[]>
+  /** Kill one or more remote processes by pid or by name. Mutating: gated by approval. */
+  processKill(request: ProcessKillRequest, signal?: AbortSignal): Promise<{ killedPids: number[] }>
+  /** Enumerate every monitor on the remote desktop. Pure observer: never gated. */
+  displays(signal?: AbortSignal): Promise<DisplayInfo[]>
+  /**
+   * Show a real Windows Action Center toast notification (WinRT
+   * `ToastNotificationManager`, not a legacy balloon-tip/`NotifyIcon` popup).
+   * Mutating: gated by approval like any other mutating action.
+   */
+  notify(title: string, message: string, appId: string, signal?: AbortSignal): Promise<void>
 }
 
 /** The JSON request written to the remote request file for the helper to read. */

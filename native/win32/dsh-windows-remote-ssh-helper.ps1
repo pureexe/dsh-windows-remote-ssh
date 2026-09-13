@@ -20,7 +20,8 @@
   address one window by handle, and it never moves the physical mouse cursor
   or steals keyboard focus unless the caller explicitly set focusFallback.
 
-  Operations: windows, apps, shot, tree, snapshot, click, type, scroll, key, launch.
+  Operations: windows, apps, shot, tree, snapshot, click, type, scroll, key,
+  move, windowControl, launch, powershell, clipboard, process, displays, notify.
 #>
 param(
   # Workdir NAME only (not a full path): resolved against $env:TEMP here so
@@ -80,6 +81,18 @@ public static class DshRemoteWin32 {
   [DllImport("user32.dll")]
   public static extern int GetSystemMetrics(int index);
 
+  [DllImport("user32.dll")]
+  public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+  [DllImport("user32.dll")]
+  public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+
+  [DllImport("user32.dll")]
+  public static extern bool IsIconic(IntPtr hWnd);
+
+  [DllImport("user32.dll")]
+  public static extern bool IsZoomed(IntPtr hWnd);
+
   [DllImport("kernel32.dll", SetLastError = true)]
   public static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
 
@@ -121,6 +134,7 @@ try {
   Add-Type -AssemblyName UIAutomationClient | Out-Null
   Add-Type -AssemblyName UIAutomationTypes | Out-Null
   Add-Type -AssemblyName System.Drawing | Out-Null
+  Add-Type -AssemblyName System.Windows.Forms | Out-Null
 } catch {
   $body = @{ ok = $false; error = @{ code = 'UIA_FAILED'; message = "cannot load UIAutomation/System.Drawing: $($_.Exception.Message)" } } | ConvertTo-Json -Depth 12 -Compress
   [System.IO.File]::WriteAllText($ResponsePath, $body, $Utf8NoBom)
@@ -511,6 +525,8 @@ function Invoke-OpWindows {
       rect = (Get-WindowRectInfo $hwnd)
       executablePath = $null
       visible = $true
+      minimized = [bool][DshRemoteWin32]::IsIconic($hwnd)
+      maximized = [bool][DshRemoteWin32]::IsZoomed($hwnd)
     }
   }
   $pidCache = @{}
@@ -522,7 +538,15 @@ function Invoke-OpWindows {
     }
     $window.executablePath = $pidCache[$window.processId]
   }
-  return $windows
+  # The unary comma forces this to stay an array on the pipeline even with
+  # exactly one (or zero) visible windows - PowerShell otherwise enumerates
+  # a returned array onto the pipeline element-by-element, so a bare
+  # `return $windows` with exactly one window would hand the *caller*
+  # (`$result = Invoke-OpWindows`) a single hashtable instead of a 1-element
+  # array, and ConvertTo-Json would then serialize it as a JSON object
+  # instead of a JSON array - exactly the bug hit by Invoke-OpDisplays below
+  # on a single-monitor host.
+  return ,$windows
 }
 
 function Invoke-OpApps {
@@ -541,6 +565,8 @@ function Invoke-OpApps {
       rect = (Get-WindowRectInfo $hwnd)
       executablePath = $null
       visible = $true
+      minimized = [bool][DshRemoteWin32]::IsIconic($hwnd)
+      maximized = [bool][DshRemoteWin32]::IsZoomed($hwnd)
     }
   }
   $apps = @()
@@ -560,7 +586,11 @@ function Invoke-OpApps {
       windows = $windows
     }
   }
-  return $apps
+  # See the matching comment in Invoke-OpWindows: without the unary comma, a
+  # single running application with windows would collapse to a bare
+  # hashtable instead of a 1-element array once it crosses the pipeline back
+  # to the caller.
+  return ,$apps
 }
 
 function Get-SnapshotRecord($hwnd, $maxElements, $maxDepth) {
@@ -599,22 +629,64 @@ function Invoke-OpSnapshot($opArgs) {
   return (Get-SnapshotRecord $hwnd $maxElements $maxDepth)
 }
 
+function Get-ScreenRegionBitmap($left, $top, $width, $height) {
+  if ($width -le 0 -or $height -le 0) { throw 'region must have right > left and bottom > top' }
+  $bitmap = New-Object System.Drawing.Bitmap($width, $height)
+  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+  try {
+    $graphics.CopyFromScreen($left, $top, 0, 0, (New-Object System.Drawing.Size($width, $height)))
+  } finally {
+    $graphics.Dispose()
+  }
+  return $bitmap
+}
+
 function Invoke-OpShot($opArgs) {
   $target = if ($null -ne $opArgs.target) { $opArgs.target } else { @{} }
   $maxSide = if ($null -ne $opArgs.maxSide) { [int]$opArgs.maxSide } else { 1600 }
   $maxElements = if ($null -ne $opArgs.maxElements) { [int]$opArgs.maxElements } else { 500 }
   $maxDepth = if ($null -ne $opArgs.maxDepth) { [int]$opArgs.maxDepth } else { 32 }
   $wholeScreen = if ($null -ne $opArgs.wholeScreen) { [bool]$opArgs.wholeScreen } else { $false }
-  if ($wholeScreen) {
-    # Deliberate, explicit whole-screen capture: windowId 0 is a sentinel
-    # meaning "not one window" and is never a valid basedOn target for a
-    # later action.
-    $bitmap = Get-PrimaryBitmap
+  $region = $opArgs.region
+  $displayIndex = if ($null -ne $opArgs.display) { [int]$opArgs.display } else { $null }
+  if ($null -ne $region) {
+    # An explicit rectangle capture takes precedence over target/wholeScreen/
+    # display: windowId 0 is the same "not one window" sentinel as a whole-
+    # screen capture and is never a valid basedOn target for a later action.
+    $left = [int]$region.left; $top = [int]$region.top
+    $width = [int]$region.right - $left; $height = [int]$region.bottom - $top
+    $bitmap = Get-ScreenRegionBitmap $left $top $width $height
     $snapshot = @{
       windowId = 0; processId = 0; executablePath = $null
-      title = 'primary screen'; className = 'Screen'
-      rect = @{ x = 0; y = 0; width = $bitmap.Width; height = $bitmap.Height }
+      title = 'screen region'; className = 'Region'
+      rect = @{ x = $left; y = $top; width = $width; height = $height }
       foreground = $true; treeHash = ''; shotHash = ''; elementCount = 0
+    }
+  } elseif ($wholeScreen) {
+    if ($null -ne $displayIndex) {
+      $screens = [System.Windows.Forms.Screen]::AllScreens
+      if ($displayIndex -lt 0 -or $displayIndex -ge $screens.Count) {
+        throw "display index $displayIndex out of range (0..$($screens.Count - 1))"
+      }
+      $bounds = $screens[$displayIndex].Bounds
+      $bitmap = Get-ScreenRegionBitmap ([int]$bounds.X) ([int]$bounds.Y) ([int]$bounds.Width) ([int]$bounds.Height)
+      $snapshot = @{
+        windowId = 0; processId = 0; executablePath = $null
+        title = "display $displayIndex"; className = 'Screen'
+        rect = @{ x = [int]$bounds.X; y = [int]$bounds.Y; width = [int]$bounds.Width; height = [int]$bounds.Height }
+        foreground = $true; treeHash = ''; shotHash = ''; elementCount = 0
+      }
+    } else {
+      # Deliberate, explicit whole-screen capture: windowId 0 is a sentinel
+      # meaning "not one window" and is never a valid basedOn target for a
+      # later action.
+      $bitmap = Get-PrimaryBitmap
+      $snapshot = @{
+        windowId = 0; processId = 0; executablePath = $null
+        title = 'primary screen'; className = 'Screen'
+        rect = @{ x = 0; y = 0; width = $bitmap.Width; height = $bitmap.Height }
+        foreground = $true; treeHash = ''; shotHash = ''; elementCount = 0
+      }
     }
   } else {
     # No target -> the current foreground window, exactly like Invoke-OpTree
@@ -694,6 +766,23 @@ function Get-ActionOutcome($hwnd, $action, $delivered, $restored, $detail) {
   return $outcome
 }
 
+function Invoke-SelectionItemAction($element, $selectionMode) {
+  $selectionItem = $null
+  if (-not $element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selectionItem)) {
+    return $false
+  }
+  switch ([string]$selectionMode) {
+    'select' { $selectionItem.Select() }
+    'add' { $selectionItem.AddToSelection() }
+    'remove' { $selectionItem.RemoveFromSelection() }
+    'toggle' {
+      if ([bool]$selectionItem.Current.IsSelected) { $selectionItem.RemoveFromSelection() } else { $selectionItem.AddToSelection() }
+    }
+    default { throw "unknown selectionMode '$selectionMode'" }
+  }
+  return $true
+}
+
 function Invoke-OpClick($opArgs) {
   $request = $opArgs.request
   $focusFallback = if ($null -ne $opArgs.focusFallback) { [bool]$opArgs.focusFallback } else { $false }
@@ -702,18 +791,24 @@ function Invoke-OpClick($opArgs) {
   $windowRect = Get-WindowRectInfo $hwnd
   $windowElement = Get-UiaElement $hwnd
   $delivered = 'posted'
+  $selectionMode = $request.selectionMode
+  $hasSelectionMode = ($null -ne $selectionMode -and $selectionMode -is [string] -and $selectionMode.Length -gt 0)
   if ($null -ne $request.elementId -and $request.elementId -is [string] -and $request.elementId.Length -gt 0) {
     $element = Find-ElementByRuntimeId $windowElement ([string]$request.elementId)
     if ($null -eq $element) { throw "element '$($request.elementId)' not found in window $hwnd (re-run screen_read)" }
-    $invoke = $null
-    if ($element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
-      $invoke.Invoke()
+    if ($hasSelectionMode -and (Invoke-SelectionItemAction $element $selectionMode)) {
       $delivered = 'uia'
     } else {
-      $center = Get-ElementCenter $element
-      $client = Get-ClientPoint $windowRect $center.x $center.y
-      Post-Click $hwnd $client.x $client.y ([string]$request.button)
-      $delivered = 'posted'
+      $invoke = $null
+      if ($element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
+        $invoke.Invoke()
+        $delivered = 'uia'
+      } else {
+        $center = Get-ElementCenter $element
+        $client = Get-ClientPoint $windowRect $center.x $center.y
+        Post-Click $hwnd $client.x $client.y ([string]$request.button)
+        $delivered = 'posted'
+      }
     }
   } else {
     if ($null -eq $request.x -or $null -eq $request.y) { throw 'click requires elementId or (x, y)' }
@@ -812,6 +907,182 @@ function Invoke-OpKey($opArgs) {
   return (Get-ActionOutcome $hwnd 'key' 'posted' $null $null)
 }
 
+function Post-MouseMove($hwnd, $cx, $cy, $buttonDown) {
+  # MK_LBUTTON = 0x0001 in wParam when the left button is held during the move.
+  $wparam = if ($buttonDown) { [IntPtr]1 } else { [IntPtr]0 }
+  [void][DshRemoteWin32]::PostMessage($hwnd, 0x200, $wparam, (Get-LParam $cx $cy))
+}
+
+function Invoke-OpMove($opArgs) {
+  $request = $opArgs.request
+  $focusFallback = if ($null -ne $opArgs.focusFallback) { [bool]$opArgs.focusFallback } else { $false }
+  $hwnd = Resolve-Window @{ windowId = $request.windowId }
+  if ($focusFallback) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
+  $windowRect = Get-WindowRectInfo $hwnd
+  $windowElement = Get-UiaElement $hwnd
+
+  function Resolve-MovePoint($elementId, $x, $y) {
+    if ($null -ne $elementId -and $elementId -is [string] -and $elementId.Length -gt 0) {
+      $element = Find-ElementByRuntimeId $windowElement ([string]$elementId)
+      if ($null -eq $element) { throw "element '$elementId' not found in window $hwnd (re-run screen_read)" }
+      $center = Get-ElementCenter $element
+      return Get-ClientPoint $windowRect $center.x $center.y
+    }
+    return Get-ClientPoint $windowRect ([int]$x) ([int]$y)
+  }
+
+  $source = Resolve-MovePoint $request.elementId $request.x $request.y
+  $drag = $request.drag
+  if ($null -ne $drag) {
+    $destination = Resolve-MovePoint $drag.toElementId $drag.toX $drag.toY
+    # Posted-message drag only: WM_MOUSEMOVE to the source, WM_LBUTTONDOWN,
+    # several interpolated WM_MOUSEMOVE steps with the button held, then
+    # WM_LBUTTONUP at the destination. This works for controls that react to
+    # simple mouse-move/button events (sliders, canvases, custom-drawn
+    # controls) - it is NOT real OLE/shell drag-and-drop (e.g. dragging a
+    # file between two Explorer windows), which requires actual
+    # SendInput-driven drag detection that posted messages cannot trigger.
+    Post-MouseMove $hwnd $source.x $source.y $false
+    [void][DshRemoteWin32]::PostMessage($hwnd, 0x201, [IntPtr]1, (Get-LParam $source.x $source.y))  # WM_LBUTTONDOWN
+    $steps = 10
+    for ($i = 1; $i -le $steps; $i++) {
+      $t = $i / $steps
+      $ix = [int]($source.x + ($destination.x - $source.x) * $t)
+      $iy = [int]($source.y + ($destination.y - $source.y) * $t)
+      Post-MouseMove $hwnd $ix $iy $true
+    }
+    [void][DshRemoteWin32]::PostMessage($hwnd, 0x202, [IntPtr]0, (Get-LParam $destination.x $destination.y))  # WM_LBUTTONUP
+    return (Get-ActionOutcome $hwnd 'move' 'posted' $null 'dragged via posted mouse messages (works only for controls that react to simple mouse events - not real OLE/shell drag-and-drop)')
+  }
+  Post-MouseMove $hwnd $source.x $source.y $false
+  return (Get-ActionOutcome $hwnd 'move' 'posted' $null $null)
+}
+
+function Invoke-OpWindowControl($opArgs) {
+  $request = $opArgs.request
+  $hwnd = Resolve-Window @{ windowId = $request.windowId }
+  $action = [string]$request.action
+  switch ($action) {
+    'minimize' { [void][DshRemoteWin32]::ShowWindow($hwnd, 6) }   # SW_MINIMIZE
+    'maximize' { [void][DshRemoteWin32]::ShowWindow($hwnd, 3) }   # SW_MAXIMIZE
+    'restore' { [void][DshRemoteWin32]::ShowWindow($hwnd, 9) }    # SW_RESTORE
+    'move' {
+      $rect = Get-WindowRectInfo $hwnd
+      $x = if ($null -ne $request.x) { [int]$request.x } else { $rect.x }
+      $y = if ($null -ne $request.y) { [int]$request.y } else { $rect.y }
+      [void][DshRemoteWin32]::MoveWindow($hwnd, $x, $y, $rect.width, $rect.height, $true)
+    }
+    'resize' {
+      $rect = Get-WindowRectInfo $hwnd
+      $width = if ($null -ne $request.width) { [int]$request.width } else { $rect.width }
+      $height = if ($null -ne $request.height) { [int]$request.height } else { $rect.height }
+      [void][DshRemoteWin32]::MoveWindow($hwnd, $rect.x, $rect.y, $width, $height, $true)
+    }
+    'close' {
+      [void][DshRemoteWin32]::PostMessage($hwnd, 0x10, [IntPtr]0, [IntPtr]0)  # WM_CLOSE
+    }
+    default { throw "unknown window_control action '$action'" }
+  }
+  return (Get-ActionOutcome $hwnd "window_control:$action" 'posted' $null $null)
+}
+
+function Invoke-OpClipboard($opArgs) {
+  $action = [string]$opArgs.action
+  if ($action -eq 'get') {
+    # Get-Clipboard/Set-Clipboard (Microsoft.PowerShell.Management, built
+    # into PS 5.1 on Windows) only see the *session's* clipboard - this must
+    # run inside the interactive Scheduled-Task session like every other op,
+    # never a plain non-interactive SSH exec.
+    $text = $null
+    try { $text = Get-Clipboard -Raw -ErrorAction Stop } catch { $text = $null }
+    if ($null -eq $text) { $text = '' }
+    return @{ action = 'get'; text = $text }
+  } elseif ($action -eq 'set') {
+    $text = [string]$opArgs.text
+    Set-Clipboard -Value $text
+    return @{ action = 'set'; text = $text }
+  } else {
+    throw "unknown clipboard action '$action'"
+  }
+}
+
+function Invoke-OpProcess($opArgs) {
+  $action = [string]$opArgs.action
+  if ($action -eq 'list') {
+    $result = @()
+    foreach ($p in (Get-Process)) {
+      $path = $null
+      try { $path = $p.Path } catch { $path = $null }
+      $title = $null
+      try {
+        if ($p.MainWindowHandle -ne [IntPtr]::Zero) { $title = $p.MainWindowTitle }
+      } catch { $title = $null }
+      $result += @{ pid = [int]$p.Id; name = [string]$p.ProcessName; executablePath = $path; mainWindowTitle = $title }
+    }
+    return @{ action = 'list'; processes = $result }
+  } elseif ($action -eq 'kill') {
+    $force = if ($null -ne $opArgs.force) { [bool]$opArgs.force } else { $false }
+    $targets = @()
+    if ($null -ne $opArgs.pid -and [int]$opArgs.pid -gt 0) {
+      $targets = @(Get-Process -Id ([int]$opArgs.pid) -ErrorAction SilentlyContinue)
+    } elseif ($null -ne $opArgs.name -and [string]$opArgs.name -ne '') {
+      $targets = @(Get-Process -Name ([string]$opArgs.name) -ErrorAction SilentlyContinue)
+    } else {
+      throw 'process kill requires pid or name'
+    }
+    $killed = @()
+    foreach ($t in $targets) {
+      if ($null -eq $t) { continue }
+      try {
+        Stop-Process -Id $t.Id -Force:$force -ErrorAction Stop
+        $killed += [int]$t.Id
+      } catch {
+        # Best-effort: a process that already exited (or can't be killed by
+        # this account) is simply not reported as killed.
+      }
+    }
+    return @{ action = 'kill'; killedPids = $killed }
+  } else {
+    throw "unknown process action '$action'"
+  }
+}
+
+function Invoke-OpDisplays {
+  $screens = [System.Windows.Forms.Screen]::AllScreens
+  $result = @()
+  for ($i = 0; $i -lt $screens.Count; $i++) {
+    $s = $screens[$i]
+    $b = $s.Bounds
+    $result += @{ index = $i; rect = @{ x = [int]$b.X; y = [int]$b.Y; width = [int]$b.Width; height = [int]$b.Height }; primary = [bool]$s.Primary }
+  }
+  # Unary comma: keeps this an array on the pipeline even with exactly one
+  # monitor (the common case on a single-display remote host) - see the
+  # matching comment in Invoke-OpWindows for why a bare `return $result`
+  # would otherwise collapse a 1-element array to a scalar hashtable, which
+  # then serializes as a JSON object instead of a JSON array.
+  return ,$result
+}
+
+function Invoke-OpNotify($opArgs) {
+  $title = [string]$opArgs.title
+  $message = [string]$opArgs.message
+  $appId = [string]$opArgs.appId
+  # The standard reflection-load technique for the WinRT toast APIs from
+  # Windows PowerShell 5.1 (no third-party module). Using the well-known
+  # built-in PowerShell AUMID as $appId (the caller's default) works on stock
+  # Windows 10/11 with no app registration.
+  [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+  [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+  $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+  $textNodes = $template.GetElementsByTagName('text')
+  [void]$textNodes.Item(0).AppendChild($template.CreateTextNode($title))
+  [void]$textNodes.Item(1).AppendChild($template.CreateTextNode($message))
+  $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
+  $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
+  $notifier.Show($toast)
+  return @{ shown = $true }
+}
+
 function Invoke-OpLaunch($opArgs) {
   $appName = [string]$opArgs.name
   $launchArgs = @()
@@ -857,6 +1128,48 @@ function Invoke-OpLaunch($opArgs) {
   return @{ processId = $resolvedId; executablePath = $path }
 }
 
+function Invoke-OpPowershell($opArgs) {
+  $script = [string]$opArgs.script
+  $timeoutMs = if ($null -ne $opArgs.timeoutMs) { [int]$opArgs.timeoutMs } else { 30000 }
+  $maxOutputLength = if ($null -ne $opArgs.maxOutputLength) { [int]$opArgs.maxOutputLength } else { 20000 }
+
+  # Written to its own temp file (not passed as a -Command argument) so
+  # arbitrary script content - quotes, newlines, anything - never has to
+  # survive a command-line-quoting round trip.
+  $scriptPath = Join-Path $env:TEMP "dsh-ps-$([guid]::NewGuid().ToString('N')).ps1"
+  [System.IO.File]::WriteAllText($scriptPath, $script, $Utf8NoBom)
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $completed = $process.WaitForExit($timeoutMs)
+    if (-not $completed) {
+      try { $process.Kill($true) } catch { }
+      throw "powershell script did not finish within ${timeoutMs}ms and was killed"
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    $truncated = $false
+    if ($stdout.Length -gt $maxOutputLength) { $stdout = $stdout.Substring(0, $maxOutputLength); $truncated = $true }
+    if ($stderr.Length -gt $maxOutputLength) { $stderr = $stderr.Substring(0, $maxOutputLength); $truncated = $true }
+    return @{
+      exitCode = [int]$process.ExitCode
+      stdout = $stdout
+      stderr = $stderr
+      truncated = $truncated
+    }
+  } finally {
+    Remove-Item -Path $scriptPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Entry point.
 # ---------------------------------------------------------------------------
@@ -880,7 +1193,14 @@ try {
     'type' { $result = Invoke-OpType $opArgs }
     'scroll' { $result = Invoke-OpScroll $opArgs }
     'key' { $result = Invoke-OpKey $opArgs }
+    'move' { $result = Invoke-OpMove $opArgs }
+    'windowControl' { $result = Invoke-OpWindowControl $opArgs }
     'launch' { $result = Invoke-OpLaunch $opArgs }
+    'powershell' { $result = Invoke-OpPowershell $opArgs }
+    'clipboard' { $result = Invoke-OpClipboard $opArgs }
+    'process' { $result = Invoke-OpProcess $opArgs }
+    'displays' { $result = Invoke-OpDisplays }
+    'notify' { $result = Invoke-OpNotify $opArgs }
     default { throw "unknown op '$($request.op)'" }
   }
   Write-DshResponse @{ ok = $true; result = $result }
