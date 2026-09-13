@@ -25,6 +25,7 @@ import {
   type AppInfo,
   type CaptureOptions,
   type ClickRequest,
+  type CursorPosition,
   type DesktopBackend,
   type DisplayInfo,
   type ElementInfo,
@@ -67,6 +68,14 @@ function expectRect(value: unknown, op: string): Rect {
     y: expectNumber(record, 'y', op),
     width: expectNumber(record, 'width', op),
     height: expectNumber(record, 'height', op),
+  }
+}
+
+function expectCursorPosition(value: unknown, op: string): CursorPosition {
+  const record = expectRecordValue(value, op)
+  return {
+    x: expectNumber(record, 'x', op),
+    y: expectNumber(record, 'y', op),
   }
 }
 
@@ -700,5 +709,10 @@ class TargetedBackend implements DesktopBackend {
 
   async notify(title: string, message: string, appId: string, signal?: AbortSignal): Promise<void> {
     await this.pool.invoke(this.target, 'notify', { title, message, appId }, signal)
+  }
+
+  async cursorPosition(signal?: AbortSignal): Promise<CursorPosition> {
+    const result = await this.pool.invoke(this.target, 'cursorPosition', {}, signal)
+    return expectCursorPosition(result, 'cursorPosition')
   }
 }

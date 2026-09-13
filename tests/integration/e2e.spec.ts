@@ -313,6 +313,16 @@ describe.skipIf(!hasTarget)('remote Windows host over SSH (live integration)', (
       }
     })
 
+    it('cursor_location: reports a position within some enumerated display\'s bounds', async () => {
+      const [position, displays] = await Promise.all([backend.cursorPosition(), backend.displays()])
+      expect(Number.isInteger(position.x)).toBe(true)
+      expect(Number.isInteger(position.y)).toBe(true)
+      const withinSomeDisplay = displays.some(display =>
+        position.x >= display.rect.x && position.x < display.rect.x + display.rect.width
+        && position.y >= display.rect.y && position.y < display.rect.y + display.rect.height)
+      expect(withinSomeDisplay).toBe(true)
+    })
+
     it('screen_shot region: captures exactly the requested screen-space rectangle', async () => {
       const shot = await backend.shot({}, 800, false, { region: { left: 0, top: 0, right: 200, bottom: 150 } })
       expect(shot.snapshot.windowId).toBe(0)

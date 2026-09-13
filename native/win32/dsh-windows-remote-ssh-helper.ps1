@@ -1272,6 +1272,13 @@ function Invoke-OpDisplays {
   return ,$result
 }
 
+function Invoke-OpCursorPosition {
+  # Same virtual-screen coordinate space as Screen.Bounds (Invoke-OpDisplays)
+  # and every window rect - no translation needed against either.
+  $pos = [System.Windows.Forms.Cursor]::Position
+  return @{ x = [int]$pos.X; y = [int]$pos.Y }
+}
+
 function Invoke-OpNotify($opArgs) {
   $title = [string]$opArgs.title
   $message = [string]$opArgs.message
@@ -1412,6 +1419,7 @@ try {
     'clipboard' { $result = Invoke-OpClipboard $opArgs }
     'process' { $result = Invoke-OpProcess $opArgs }
     'displays' { $result = Invoke-OpDisplays }
+    'cursorPosition' { $result = Invoke-OpCursorPosition }
     'notify' { $result = Invoke-OpNotify $opArgs }
     default { throw "unknown op '$($request.op)'" }
   }

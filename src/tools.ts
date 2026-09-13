@@ -2,10 +2,10 @@
  * The model tools dsh-windows-remote-ssh registers:
  *
  * - Pure observers, never gated: `screen_shot`, `screen_read`, `app_list`,
- *   `display_list`, `wait_for` (polls, but never mutates), `clipboard`
- *   `action: 'get'`, `process` `action: 'list'`, `read_text`, `read_table`
- *   (freshness/identity still checked via {@link ActionExecutor.performRead},
- *   just never gated by approval).
+ *   `display_list`, `cursor_location`, `wait_for` (polls, but never mutates),
+ *   `clipboard` `action: 'get'`, `process` `action: 'list'`, `read_text`,
+ *   `read_table` (freshness/identity still checked via
+ *   {@link ActionExecutor.performRead}, just never gated by approval).
  * - Window-scoped mutating actions, gated by approval and crossing
  *   {@link ActionExecutor}'s freshness/process-identity checks: `click`,
  *   `type`, `scroll`, `key`, `move`, `multi_action`, `window_control`,
@@ -168,9 +168,25 @@ function windowLine(window: ObservedWindowValue): string {
   return `"${window.title}" (windowId ${window.windowId}, pid ${window.processId}, ${window.executablePath ?? 'unknown executable'})`
 }
 
-/** Plain-text fallback description for a captured screenshot. */
+/** Plain-text fallback description for a captured screenshot (used only when no image is attached). */
 function shotDescription(window: ObservedWindowValue, width: number, height: number): string {
   return `${width}x${height} screenshot of the remote ${windowLine(window)}; run screen_read on the same window for the structured element list and pixel positions.`
+}
+
+/**
+ * When a screenshot image is smaller than the real area it captured — this
+ * plugin's own `maxSide` downscaling, and/or the harness's attachment store
+ * shrinking it further on save — say so and give the exact conversion.
+ * `click`/`move`/`key`/etc. all take real screen coordinates (the same
+ * space as `window.rect` and `display_list`), never a raw pixel position
+ * read off the image, so a caller estimating a click target visually needs
+ * this to convert correctly. Returns `undefined` when the image is already
+ * at the captured area's real size (the common case) — nothing to warn about.
+ */
+export function shotScaleNote(window: ObservedWindowValue, imageWidth: number, imageHeight: number): string | undefined {
+  const { rect } = window
+  if (imageWidth <= 0 || imageHeight <= 0 || (imageWidth === rect.width && imageHeight === rect.height)) return undefined
+  return `Note: this image (${imageWidth}x${imageHeight}) is downscaled from the real captured area, ${rect.width}x${rect.height} at screen origin (${rect.x}, ${rect.y}). click/move/key/etc. take real screen coordinates, not image pixels — to act at image pixel (px, py), use screen coordinates (${rect.x} + px * ${(rect.width / imageWidth).toFixed(4)}, ${rect.y} + py * ${(rect.height / imageHeight).toFixed(4)}).`
 }
 
 /**
@@ -288,6 +304,10 @@ export function screenShotTool(services: ToolServices) {
           },
           imageBase64: { type: 'string', description: 'Present only when no attachment store is mounted: raw base64 PNG bytes.' },
           description: { type: 'string' },
+          scaleNote: {
+            type: 'string',
+            description: 'Present only when the image is smaller than the real captured area (maxSide and/or attachment-store downscaling): the real size/origin and the exact pixel-to-screen-coordinate conversion for click/move/key.',
+          },
         },
         additionalProperties: false,
       },
@@ -298,10 +318,13 @@ export function screenShotTool(services: ToolServices) {
           image?: ImageAttachmentRef
           imageBase64?: string
           description: string
+          scaleNote?: string
         }
+        const body = result.image === undefined && result.imageBase64 === undefined ? result.description : 'Image attached; cite this observationId in later actions.'
+        const scaleLine = result.scaleNote !== undefined ? `\n${result.scaleNote}` : ''
         const blocks: ContentBlock[] = [{
           type: 'text',
-          text: `Screenshot of the remote ${windowLine(result.window)} captured.\nobservationId: ${result.observationId}\n${result.image === undefined && result.imageBase64 === undefined ? result.description : 'Image attached; cite this observationId in later actions.'}`,
+          text: `Screenshot of the remote ${windowLine(result.window)} captured.\nobservationId: ${result.observationId}\n${body}${scaleLine}`,
         }]
         if (result.image !== undefined) blocks.push({ type: 'image', attachment: result.image })
         return blocks
@@ -328,7 +351,6 @@ export function screenShotTool(services: ToolServices) {
       }, exec.signal)
       const sanitized = observedWindow(shot.snapshot, config.maxTextLength)
       const record = observations.record(shot.snapshot, sshTarget)
-      const description = shotDescription(sanitized, shot.width, shot.height)
 
       let image: ImageAttachmentRef | undefined
       let imageBase64: string | undefined
@@ -358,6 +380,17 @@ export function screenShotTool(services: ToolServices) {
         }
       }
 
+      // The attachment store can shrink the image further than this
+      // plugin's own maxSide resize already did (see `image.originalDimensions`
+      // vs `image.width`/`height`) - describe (and scale-warn about)
+      // whatever the model will actually see, not the pre-attachment-store size.
+      const renderedWidth = image?.width ?? shot.width
+      const renderedHeight = image?.height ?? shot.height
+      const description = shotDescription(sanitized, renderedWidth, renderedHeight)
+      const scaleNote = image !== undefined || imageBase64 !== undefined
+        ? shotScaleNote(sanitized, renderedWidth, renderedHeight)
+        : undefined
+
       auditObservation(exec, {
         observationId: record.id,
         windowId: shot.snapshot.windowId,
@@ -383,6 +416,7 @@ export function screenShotTool(services: ToolServices) {
         ...image !== undefined ? { image } : {},
         ...imageBase64 !== undefined ? { imageBase64 } : {},
         description,
+        ...scaleNote !== undefined ? { scaleNote } : {},
       }
     },
   })
@@ -1806,6 +1840,47 @@ export function displayListTool(services: ToolServices) {
 }
 
 /**
+ * `cursor_location` — the real OS cursor's current position, in the same
+ * virtual-screen coordinate space as every window `rect` and every
+ * `display_list` entry. Pure observer: never gated, like `display_list`.
+ * Useful to confirm where a `move`/`click` actually landed, or to sanity
+ * check a computed click target before spending an action on it.
+ */
+export function cursorLocationTool(services: ToolServices) {
+  const { config, getBackend } = services
+  return defineTool({
+    name: 'cursor_location',
+    description:
+      'Current mouse cursor position, in the same screen coordinates as window rects and display_list. Read-only: never needs approval.',
+    parameters: {
+      ...sshOverrideParameter,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          x: { type: 'integer' },
+          y: { type: 'integer' },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { x: number; y: number }
+        return [{ type: 'text', text: `Cursor is at (${result.x}, ${result.y}).` }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as { ssh?: SshConfig }
+      const backend = getBackend(resolveSshTarget(parsed.ssh, config.ssh))
+      const position = await backend.cursorPosition(exec.signal)
+      return { ok: true, ...position }
+    },
+  })
+}
+
+/**
  * `notify` — show a real Windows Action Center toast notification (WinRT
  * `ToastNotificationManager`, not a legacy balloon-tip/`NotifyIcon` popup).
  * Mutating: gated by approval like `powershell` (no window subject).
@@ -2320,6 +2395,7 @@ export function allTools(services: ToolServices) {
     clipboardTool(services),
     processTool(services),
     displayListTool(services),
+    cursorLocationTool(services),
     notifyTool(services),
     ...services.config.enablePowerShellTool ? [powershellTool(services)] : [],
   ]

@@ -243,6 +243,12 @@ export interface DisplayInfo {
   primary: boolean
 }
 
+/** The real OS cursor's current position, in the same virtual-screen coordinate space as every window `rect` and every display's `rect`. */
+export interface CursorPosition {
+  x: number
+  y: number
+}
+
 /** One running process on the remote host. */
 export interface ProcessInfo {
   pid: number
@@ -400,6 +406,13 @@ export interface DesktopBackend {
   processKill(request: ProcessKillRequest, signal?: AbortSignal): Promise<{ killedPids: number[] }>
   /** Enumerate every monitor on the remote desktop. Pure observer: never gated. */
   displays(signal?: AbortSignal): Promise<DisplayInfo[]>
+  /**
+   * The real OS cursor's current position. Pure observer: never gated. Not
+   * `basedOn`-checked against anything — the cursor moves constantly on its
+   * own, so there is no "stale" cursor position to compare against, only a
+   * current one.
+   */
+  cursorPosition(signal?: AbortSignal): Promise<CursorPosition>
   /**
    * Show a real Windows Action Center toast notification (WinRT
    * `ToastNotificationManager`, not a legacy balloon-tip/`NotifyIcon` popup).

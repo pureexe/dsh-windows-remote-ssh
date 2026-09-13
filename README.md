@@ -140,6 +140,7 @@ With `lazyToolLoading` on (the default), only `pc_control` is registered at star
 | `screen_read` | ✅ | — | UI Automation accessibility tree + pixel-location hints |
 | `app_list` | ✅ | — | Enumerate running applications and their windows (now includes `minimized`/`maximized`) |
 | `display_list` | ✅ | — | Enumerate every monitor: index, rect, whether primary |
+| `cursor_location` | ✅ | — | Current mouse cursor position, in the same screen coordinates as window rects |
 | `wait_for` | ✅ | — | Poll (~500ms) until a condition is met or times out, then return a fresh observation |
 | `clipboard` (get) | ✅ | — | Read the remote clipboard text |
 | `process` (list) | ✅ | — | List running processes |
@@ -160,6 +161,21 @@ With `lazyToolLoading` on (the default), only `pc_control` is registered at star
 | `read_text` | ✅ | — | Read an element's full content + current selection via the UIA Text pattern |
 | `read_table` | ✅ | — | Read a grid/table element's structured cell data via the Grid/Table patterns |
 | `powershell` | | Yes | Run an arbitrary script with full user privileges — off by default, see below |
+
+### `screen_shot` — the image can be smaller than the real captured area
+
+`click`/`move`/`key`/etc. all take real screen coordinates — the same space
+as `window.rect` and `display_list` — never a raw pixel position read off
+the screenshot image. The image itself can be downscaled from that real
+size for two independent reasons: this plugin's own `maxSide` cap, and/or
+the harness's attachment store shrinking it further on save. Whenever the
+returned image is smaller than the real captured area, the tool result
+carries a `scaleNote` stating the real size/origin and the exact
+pixel-to-screen-coordinate conversion, so a caller that estimated a click
+target visually can convert it correctly instead of clicking the wrong
+spot. `cursor_location` is also useful here — it reports where the real
+cursor actually is, in the same real screen coordinates, to sanity-check a
+computed target or confirm where a previous action actually landed.
 
 ### `filesystem_pull` / `filesystem_push` — move files between the two machines
 
