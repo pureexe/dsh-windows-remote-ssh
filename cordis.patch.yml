@@ -54,11 +54,13 @@
         # foreground as a fallback when posted input is unavailable.
         # 'never' (default) never steals focus; 'allow' permits the fallback.
         focusFallback: never
-        # How screen_shot renders: 'auto' (default) always attaches the
-        # captured image as an attachment (the harness's own pipeline adapts
-        # it to whatever the current model accepts); 'text' always sends only
-        # the text description instead, for a deployment that never wants
-        # image bytes leaving the plugin.
+        # How screen_shot and filesystem_pull (of an image file) render:
+        # 'auto' (default) always attaches the captured/pulled image as an
+        # attachment; 'text' always sends only a text description/generic
+        # file attachment instead. Set 'text' for a model route that can't
+        # take images at all, or that caps images per prompt below what a
+        # multi-screenshot conversation will accumulate (e.g. some
+        # vLLM-served models reject a request with more than one image).
         imageMode: auto
         # SSH handshake timeout in milliseconds (1..120000).
         connectTimeoutMs: 20000

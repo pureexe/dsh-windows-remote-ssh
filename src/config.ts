@@ -156,7 +156,7 @@ export interface Config {
   auditSessionEvents?: boolean
   /** Whether mutating actions may bring the target window to the foreground as a fallback (default 'never'). */
   focusFallback?: FocusFallback
-  /** How `screen_shot` renders: `'auto'` (default) always attaches the image; `'text'` always sends only the description. */
+  /** How `screen_shot`/`filesystem_pull` render an image: `'auto'` (default) always attaches it; `'text'` always sends only a description/generic file attachment (e.g. for a model route capping images per prompt). */
   imageMode?: ImageMode
   /** Per-SSH-connect timeout in milliseconds (default 20000). */
   connectTimeoutMs?: number

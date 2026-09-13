@@ -1116,7 +1116,7 @@ export function filesystemPullTool(services: ToolServices) {
       const attachments = ctx.get('attachments') as AttachmentStore | undefined
 
       const imageMediaType = detectImageMediaType(data)
-      if (imageMediaType !== undefined && attachments !== undefined) {
+      if (imageMediaType !== undefined && attachments !== undefined && config.imageMode !== 'text') {
         try {
           const image = await attachments.saveImage({ data, mediaType: imageMediaType, name })
           return { ok: true, remotePath, sizeBytes: data.length, kind: 'image' as const, image }

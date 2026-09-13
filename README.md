@@ -151,7 +151,7 @@ With `lazyToolLoading` on (the default), only `pc_control` is registered at star
 | `multi_action` | | Yes | Run a batch of click/type sub-actions (with optional list `selectionMode`) against one observation |
 | `window_control` | | Yes | Minimize/maximize/restore/move/resize/close a window |
 | `app_launch` | | Yes | Launch an application by name or path |
-| `filesystem_pull` | | Yes | Download a file from the remote host (image → attachment, small text → inline, else → file attachment) |
+| `filesystem_pull` | | Yes | Download a file from the remote host (image → attachment unless `imageMode: 'text'`, small text → inline, else → file attachment) |
 | `filesystem_push` | | Yes | Upload a file to the remote host, from literal content or a re-supplied attachment reference |
 | `clipboard` (set) | | Yes | Replace the remote clipboard text |
 | `process` (kill) | | Yes | Kill one or more processes by pid or name |
