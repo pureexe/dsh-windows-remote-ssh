@@ -138,6 +138,16 @@ export interface ResolvedSshConfig {
 export interface Config {
   /** Remote target connection. All fields also read from `SSH_*` env vars. */
   ssh?: SshConfig
+  /**
+   * Register only the `pc_control` tool at startup instead of the full set
+   * (default true). Every registered tool's schema costs prompt tokens on
+   * every turn whether or not the conversation ever calls it, and most
+   * conversations only need a handful of the ~20 this plugin defines.
+   * `pc_control` registers the rest, once, the first time it's called.
+   * Set false to register everything immediately (the pre-1.0 behavior),
+   * e.g. for a deployment that already restricts which tools an agent sees.
+   */
+  lazyToolLoading?: boolean
   /** Gate every mutating action (click/type/scroll/key/app_launch) behind approval (default true). */
   requireApproval?: boolean
   /** Window title or executable-path regexes that skip the approval ask (still audited; default []). */
@@ -252,6 +262,7 @@ export interface ResolvedConfig {
    * call must supply its own `ssh` argument (see {@link resolveSshTarget}).
    */
   ssh: ResolvedSshConfig | undefined
+  lazyToolLoading: boolean
   requireApproval: boolean
   autoApproveMatchers: ReadonlyArray<RegExp>
   auditSessionEvents: boolean
@@ -292,6 +303,7 @@ export const Config: z<Config> = z.object({
     strictHostKeyChecking: z.boolean().default(true),
     remoteWorkdir: z.string(),
   }),
+  lazyToolLoading: z.boolean().default(true),
   requireApproval: z.boolean().default(true),
   autoApproveWindows: z.array(z.string()).default([]),
   auditSessionEvents: z.boolean().default(true),
@@ -524,6 +536,9 @@ export function resolveSshTarget(raw: SshConfig | undefined, fallback: ResolvedS
 export function resolveConfig(config: Config | undefined): ResolvedConfig {
   const ssh = resolveSsh(config?.ssh)
 
+  const lazyToolLoading = config?.lazyToolLoading ?? true
+  if (typeof lazyToolLoading !== 'boolean') invalid('lazyToolLoading', 'must be a boolean')
+
   const requireApproval = config?.requireApproval ?? true
   if (typeof requireApproval !== 'boolean') invalid('requireApproval', 'must be a boolean')
 
@@ -634,6 +649,7 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
 
   return Object.freeze({
     ssh,
+    lazyToolLoading,
     requireApproval,
     autoApproveMatchers: Object.freeze(autoApproveMatchers),
     auditSessionEvents,

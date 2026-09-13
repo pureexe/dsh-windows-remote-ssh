@@ -35,6 +35,11 @@
           # Kept short on purpose: it rides inside a Scheduled Task command
           # line that has a 261-character limit.
           remoteWorkdir: dsh-rssh
+        # Register only the `pc_control` tool at startup; it registers the
+        # rest (screen_shot, click, app_launch, ...) the first time it's
+        # called, saving prompt tokens on every turn until a conversation
+        # actually needs them. Set false to register everything immediately.
+        lazyToolLoading: true
         # Gate every mutating action (click/type/scroll/key/app_launch) behind
         # approval. Observers (screen_shot/screen_read/app_list) never ask.
         requireApproval: false

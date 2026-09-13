@@ -128,6 +128,7 @@ describe('resolveConfig', () => {
   it('applies defaults for every optional field', () => {
     clearSshEnv()
     const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' } })
+    expect(resolved.lazyToolLoading).toBe(true)
     expect(resolved.requireApproval).toBe(true)
     expect(resolved.focusFallback).toBe('never')
     expect(resolved.imageMode).toBe('auto')
@@ -144,6 +145,21 @@ describe('resolveConfig', () => {
     clearSshEnv()
     const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, enablePowerShellTool: true })
     expect(resolved.enablePowerShellTool).toBe(true)
+  })
+
+  it('accepts an explicit lazyToolLoading: false', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, lazyToolLoading: false })
+    expect(resolved.lazyToolLoading).toBe(false)
+  })
+
+  it('rejects a non-boolean lazyToolLoading', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({
+      ssh: { host: 'h', user: 'u', password: 'p' },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      lazyToolLoading: 'yes' as any,
+    })).toThrow(/lazyToolLoading/u)
   })
 
   it('rejects an out-of-range powerShellTimeoutMs', () => {

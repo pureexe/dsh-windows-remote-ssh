@@ -131,8 +131,11 @@ silently guesses or hangs.
 
 ## Tools
 
+With `lazyToolLoading` on (the default), only `pc_control` is registered at startup; calling it once registers every other tool below for the rest of the conversation, so a session that never needs remote control never pays the prompt-token cost of the other ~20 schemas. Set `lazyToolLoading: false` to register everything immediately instead.
+
 | Tool | Read-only | Approval | Purpose |
 |------|-----------|----------|---------|
+| `pc_control` | ✅ | — | Load the rest of this plugin's tools (only present when `lazyToolLoading` is on) |
 | `screen_shot` | ✅ | — | Capture a window/screen (or a `region`/`display`) as an image attachment (or text-only description with `imageMode: 'text'`) |
 | `screen_read` | ✅ | — | UI Automation accessibility tree + pixel-location hints |
 | `app_list` | ✅ | — | Enumerate running applications and their windows (now includes `minimized`/`maximized`) |
@@ -433,7 +436,7 @@ Identity and the observation-age check always apply regardless.
 All fields live under one `Config` object (Schemastery-validated; invalid
 values fail the profile load loudly, not at call time). See the fully
 commented `cordis.patch.yml` for the complete list and defaults:
-`ssh.*`, `requireApproval`, `autoApproveWindows`, `auditSessionEvents`,
+`ssh.*`, `lazyToolLoading`, `requireApproval`, `autoApproveWindows`, `auditSessionEvents`,
 `focusFallback`, `imageMode`, `connectTimeoutMs`, `helperTimeoutMs`,
 `maxScreenshotSide`, `staleCheckTree`, `staleCheckPixels`, `maxObservationAgeMs`,
 `maxCachedObservations`, `maxElements`, `maxTreeDepth`, `maxTextLength`,

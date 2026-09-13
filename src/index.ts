@@ -28,7 +28,7 @@ import { ActionExecutor } from './actions.ts'
 import { Config, resolveConfig } from './config.ts'
 import { ObservationStore } from './observe.ts'
 import { createBackendPool } from './platform/selection.ts'
-import { allTools, type ToolServices } from './tools.ts'
+import { allTools, pcControlTool, type ToolServices } from './tools.ts'
 
 export const name = 'dsh-windows-remote-ssh'
 
@@ -42,16 +42,23 @@ export { ObservationStore, observationIdOf, type ObservationRecord, type Freshne
 export { ActionExecutor, type ActionExecutorDeps, type ApprovalKind } from './actions.ts'
 export { createBackendPool } from './platform/selection.ts'
 export { SshHelperBackend } from './platform/runner.ts'
-export { allTools, type ToolServices } from './tools.ts'
+export { allTools, pcControlTool, type ToolServices } from './tools.ts'
 export { OBSERVED_EVENT, ACTION_EVENT, type ObservedEvent, type ActionEvent, type ProcessFacts } from './events.ts'
 export { sanitizeText, sanitizePath, redactSensitive, sanitizeVisible } from './sanitize.ts'
 
 /**
  * Mount the plugin: resolve config (including the SSH connection), build the
- * backend, and register every tool through `ctx.tools.register` (each
+ * backend, and register tools through `ctx.tools.register` (each
  * registration is an effect whose disposer removes exactly that tool on
  * stop/HMR). The SSH connection itself is lazy — nothing dials the remote
  * host until the first tool call — and is closed when the plugin unmounts.
+ *
+ * With `config.lazyToolLoading` (default true), only `pc_control` is
+ * registered here; it registers the rest of `allTools()` itself, once,
+ * the first time it's called — every registered tool's schema costs
+ * prompt tokens on every turn regardless of use, and most conversations
+ * only need a handful of the ~20 this plugin defines. Set it false to
+ * register everything immediately instead (the pre-1.0 behavior).
  *
  * @param ctx - context carrying the tools registry.
  * @param config - raw loader config; defaults applied through {@link resolveConfig}.
@@ -67,7 +74,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   ctx.effect(() => () => pool.close(), 'dsh-windows-remote-ssh: close every pooled SSH connection')
 
-  for (const tool of allTools(services)) {
-    ctx.effect(() => ctx.tools.register(tool), `dsh-windows-remote-ssh: ${tool.name} tool`)
+  if (resolved.lazyToolLoading) {
+    ctx.effect(() => ctx.tools.register(pcControlTool(services)), 'dsh-windows-remote-ssh: pc_control tool')
+  } else {
+    for (const tool of allTools(services)) {
+      ctx.effect(() => ctx.tools.register(tool), `dsh-windows-remote-ssh: ${tool.name} tool`)
+    }
   }
 }

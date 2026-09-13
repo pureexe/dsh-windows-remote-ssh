@@ -74,11 +74,9 @@ const sshOverrideParameter = {
   ssh: {
     type: 'object' as const,
     description:
-      'Remote SSH target for this call. Required if the plugin has no configured default; when given, overrides it. '
-      + 'Prefer a configured default over sending host/user/password here — this argument (including any password) '
-      + 'is visible to the model and is captured by the harness\'s tool-call logging. If host/user are given but '
-      + 'neither password nor privateKeyPath is, the plugin tries the harness host\'s own default SSH identity '
-      + '(~/.ssh/id_ed25519, id_ecdsa, id_rsa) before failing.',
+      'Remote SSH target for this call; required if no default is configured, else overrides it. Prefer a configured '
+      + 'default over passing credentials here (visible to the model, logged). Falls back to the harness host\'s '
+      + 'default SSH identity if no password/privateKeyPath given.',
     properties: {
       host: { type: 'string' as const, description: 'Hostname or IP of the remote Windows machine.' },
       port: { type: 'integer' as const, description: 'SSH port (default 22).' },
@@ -205,12 +203,12 @@ export function screenShotTool(services: ToolServices) {
   return defineTool({
     name: 'screen_shot',
     description:
-      'Capture a screenshot of a window on the remote Windows host reachable over SSH: the addressed window, or the current foreground window when no target is given (matching screen_read). Pass wholeScreen: true to instead capture the entire primary screen (ignores target) — that capture has no single owning window, so its windowId is 0 and cannot be used as a basedOn target for click/type/scroll/key afterward; use it only to look at multiple windows/the desktop at once. With wholeScreen: true, pass display: N (from display_list) to capture a specific monitor instead of the primary one. Pass region: {left, top, right, bottom} (absolute screen coordinates, from display_list/app_list/screen_read) to capture exactly that rectangle instead — takes precedence over target/wholeScreen/display. Returns an observationId that later actions cite in `basedOn` (region/display captures are not a valid basedOn target, same as wholeScreen). The result includes the image (unless the plugin is configured with imageMode: "text", in which case it includes only a text description). Read-only: never needs approval.',
+      'Capture a screenshot: the addressed window, or foreground if none given (matches screen_read). wholeScreen: true captures the whole screen instead (one monitor via display: N); region: {left,top,right,bottom} captures a rectangle instead (overrides target/wholeScreen/display) — neither is a valid basedOn target. Includes an image unless imageMode is "text". Read-only: never needs approval.',
     parameters: {
       ...sshOverrideParameter,
       target: {
         type: 'object',
-        description: 'Which window to capture (windowId, windowTitle, or processId); omitted = the current foreground window. Ignored when wholeScreen or region is given.',
+        description: 'Window to capture (windowId, windowTitle, or processId); default foreground window. Ignored if wholeScreen or region given.',
         properties: {
           windowId: { type: 'integer', description: 'Native window handle from app_list or screen_read.' },
           windowTitle: { type: 'string', description: 'Visible window title (matched case-insensitively by substring).' },
@@ -218,11 +216,11 @@ export function screenShotTool(services: ToolServices) {
         },
         additionalProperties: false,
       },
-      wholeScreen: { type: 'boolean', description: 'Capture the entire primary screen (or, with display, one specific monitor) instead of one window (default false). The result cannot be used as a basedOn target for a later action.' },
-      display: { type: 'integer', description: 'Monitor index from display_list; only applies when wholeScreen is true. Omitted = the primary screen.' },
+      wholeScreen: { type: 'boolean', description: 'Capture the whole screen (or one monitor, with display) instead of a window (default false). Not a valid basedOn target.' },
+      display: { type: 'integer', description: 'Monitor index from display_list; only with wholeScreen. Default primary screen.' },
       region: {
         type: 'object',
-        description: 'Capture exactly this screen-space rectangle instead of a window/whole screen (absolute coordinates). Takes precedence over target/wholeScreen/display. The result cannot be used as a basedOn target for a later action.',
+        description: 'Capture this screen rectangle instead; overrides target/wholeScreen/display. Not a valid basedOn target.',
         properties: {
           left: { type: 'integer', required: true as const },
           top: { type: 'integer', required: true as const },
@@ -233,7 +231,7 @@ export function screenShotTool(services: ToolServices) {
       },
       maxSide: {
         type: 'integer',
-        description: `Longest side in pixels (${MIN_SCREENSHOT_SIDE}-${MAX_SCREENSHOT_SIDE}); larger captures are downscaled. Defaults to the configured maxScreenshotSide, but an explicit value here is honored even above that default (up to the absolute ceiling) - ask for more when you genuinely need higher resolution, e.g. to read small text.`,
+        description: `Longest side in pixels (${MIN_SCREENSHOT_SIDE}-${MAX_SCREENSHOT_SIDE}); larger captures are downscaled. Defaults to maxScreenshotSide; explicit values honored above it up to the ceiling.`,
       },
     },
     output: {
@@ -275,7 +273,7 @@ export function screenShotTool(services: ToolServices) {
               name: { type: 'string' },
               originalDimensions: {
                 type: 'object',
-                description: 'Present only when the attachment store downscaled this image on save: its input dimensions before that normalization.',
+                description: 'Original dimensions, present only if the attachment store downscaled the image on save.',
                 properties: {
                   width: { type: 'integer' },
                   height: { type: 'integer' },
@@ -397,7 +395,7 @@ export function screenReadTool(services: ToolServices) {
   return defineTool({
     name: 'screen_read',
     description:
-      'Read a window on the remote Windows host as structured text: its UI Automation accessibility tree (element ids, types, names, rectangles, supported patterns) plus pixel-location hints with colors. Returns an observationId that later actions cite in `basedOn`; elements are addressed by their elementId. Read-only: never needs approval.',
+      'Read a window\'s UIA accessibility tree (element id/type/name/rect/patterns) plus pixel-color hints. Returns observationId for `basedOn`; elements addressed by elementId. Read-only: never needs approval.',
     parameters: {
       ...sshOverrideParameter,
       target: {
@@ -580,7 +578,7 @@ function actionOutputSchema(withRestored: boolean) {
 const basedOnParameters = {
   basedOn: {
     type: 'object' as const,
-    description: 'The observation this action is based on; the action fails if the remote screen changed since that observation.',
+    description: 'Cited observation this action is based on; fails if the remote screen changed since.',
     properties: {
       observationId: { type: 'string' as const, description: 'observationId returned by screen_shot or screen_read.', required: true as const },
       windowId: { type: 'integer' as const, description: 'windowId of the observed window.', required: true as const },
@@ -612,7 +610,7 @@ export function clickTool(services: ToolServices) {
   return defineTool({
     name: 'click',
     description:
-      'Click an element or a coordinate inside an observed window on the remote Windows host. Requires `basedOn` (a fresh observationId from screen_shot/screen_read); the call fails if the remote screen changed since that observation. Never steals foreground focus. Requires approval unless the window is allowlisted.',
+      'Click an element (elementId) or coordinate in an observed window. Requires `basedOn`; fails if the screen changed since. Never steals focus. Requires approval unless allowlisted.',
     parameters: {
       ...basedOnParameters,
       target: {
@@ -675,7 +673,7 @@ export function typeTool(services: ToolServices) {
   return defineTool({
     name: 'type',
     description:
-      'Type text into an editable element of an observed window on the remote Windows host (addressed by elementId from screen_read; the element must expose a value pattern). Requires `basedOn`; fails if the remote screen changed since that observation. Never steals foreground focus. Requires approval unless the window is allowlisted. On failure the previous control text is restored when rollback is enabled.',
+      'Type text into an editable element (elementId; needs a value pattern). Requires `basedOn`; fails if the screen changed since. Never steals focus. Requires approval unless allowlisted. Restores prior text on failure if rollback is enabled.',
     parameters: {
       ...basedOnParameters,
       elementId: { type: 'string', description: 'Editable element id from screen_read.', required: true as const },
@@ -726,7 +724,7 @@ export function scrollTool(services: ToolServices) {
   return defineTool({
     name: 'scroll',
     description:
-      'Scroll an element (by elementId) or the observed window on the remote Windows host. Requires `basedOn`; fails if the remote screen changed since that observation. Never steals foreground focus. Requires approval unless the window is allowlisted.',
+      'Scroll an element (elementId) or the window itself. Requires `basedOn`; fails if the screen changed since. Never steals focus. Requires approval unless allowlisted.',
     parameters: {
       ...basedOnParameters,
       elementId: { type: 'string', description: 'Optional scrollable element id from screen_read; omitted = scroll the window itself.' },
@@ -779,7 +777,7 @@ export function keyTool(services: ToolServices) {
   return defineTool({
     name: 'key',
     description:
-      'Send a key combination (e.g. "Ctrl+S", "Enter", "Alt+F4") to an observed window on the remote Windows host via posted window messages. Requires `basedOn`; fails if the remote screen changed since that observation. Never steals foreground focus — applications that ignore posted input will not react; prefer click/type for those. Requires approval unless the window is allowlisted.',
+      'Send a key combo (e.g. "Ctrl+S") to an observed window via posted messages. Requires `basedOn`; fails if the screen changed since. Never steals focus — apps ignoring posted input won\'t react; use click/type instead. Requires approval unless allowlisted.',
     parameters: {
       ...basedOnParameters,
       keys: { type: 'string', description: 'Key combination, e.g. "Ctrl+S" or "Enter".', required: true as const },
@@ -818,7 +816,7 @@ export function appListTool(services: ToolServices) {
   return defineTool({
     name: 'app_list',
     description:
-      'List running desktop applications and their visible windows (windowId, title, process id, executable path) on the remote Windows host. Read-only: never needs approval. Use the returned windowIds as screen_shot/screen_read targets.',
+      'List running desktop apps and their visible windows (windowId, title, pid, executable path). Read-only: never needs approval. Use windowIds as screen_shot/screen_read targets.',
     parameters: {
       ...sshOverrideParameter,
     },
@@ -909,7 +907,7 @@ export function appLaunchTool(services: ToolServices) {
   return defineTool({
     name: 'app_launch',
     description:
-      'Launch a desktop application on the remote Windows host by name (e.g. "notepad") or executable path, with optional arguments. Requires approval unless requireApproval is off or the name/path is allowlisted. Returns the new process identity.',
+      'Launch an app by name (e.g. "notepad") or path, with optional args. Requires approval unless off or allowlisted. Returns the new process\'s pid/path.',
     parameters: {
       ...sshOverrideParameter,
       name: { type: 'string', description: 'Application name (resolved through the executable search path) or full path.', required: true as const },
@@ -960,11 +958,11 @@ export function powershellTool(services: ToolServices) {
   return defineTool({
     name: 'powershell',
     description:
-      'Run an arbitrary PowerShell script on the remote Windows host, with the full privileges of the connected user - not scoped to any window or element, and not sandboxed beyond what that account can already do. Use this only when screen_shot/screen_read/click/type/scroll/key/app_list/app_launch genuinely cannot accomplish the task (e.g. reading/writing files, querying system state, managing services, registry access). Requires approval unless requireApproval is off. Returns stdout, stderr, and the exit code; output longer than the configured cap is truncated.',
+      'Run a PowerShell script on the remote host with full user privileges — unscoped, unsandboxed. Use only when other tools can\'t do the task. Requires approval unless off. Returns stdout/stderr/exit code; output over cap truncated.',
     parameters: {
       ...sshOverrideParameter,
       script: { type: 'string', description: 'The PowerShell script/command(s) to run on the remote host.', required: true as const },
-      timeoutMs: { type: 'integer', description: `Timeout for this script in milliseconds (1-${MAX_POWERSHELL_TIMEOUT_MS}; default from plugin config). The process is killed if it runs longer. Raise this for a script you expect to genuinely take a while (e.g. a deep recursive file search) - the surrounding transport waits at least this long for a response.` },
+      timeoutMs: { type: 'integer', description: `Timeout in ms (1-${MAX_POWERSHELL_TIMEOUT_MS}; default from config). Killed if exceeded; raise for long-running scripts.` },
     },
     output: {
       schema: {
@@ -1031,7 +1029,7 @@ export function filesystemPullTool(services: ToolServices) {
   return defineTool({
     name: 'filesystem_pull',
     description:
-      'Download one file from the remote Windows host to the machine running the harness, so it can be inspected here. An image comes back as an image attachment (visible directly); small text comes back inline as a string; anything else (large, or not text) is stored as a file attachment — cite the returned reference in filesystem_push to write it back unchanged. Requires approval unless requireApproval is off.',
+      'Download a file for inspection here: an image returns as an image attachment, small text inline, else a file attachment (cite it in filesystem_push to write back unchanged). Requires approval unless requireApproval is off.',
     parameters: {
       ...sshOverrideParameter,
       remotePath: { type: 'string', description: 'Full path to the file on the remote host, e.g. C:\\Users\\me\\Desktop\\photo.png.', required: true as const },
@@ -1056,7 +1054,7 @@ export function filesystemPullTool(services: ToolServices) {
               name: { type: 'string' },
               originalDimensions: {
                 type: 'object',
-                description: 'Present only when the attachment store downscaled this image on save: its input dimensions before that normalization.',
+                description: 'Original dimensions, present only if the attachment store downscaled the image on save.',
                 properties: {
                   width: { type: 'integer' },
                   height: { type: 'integer' },
@@ -1155,7 +1153,7 @@ export function filesystemPushTool(services: ToolServices) {
   return defineTool({
     name: 'filesystem_push',
     description:
-      'Upload a file to the remote Windows host: either literal text/base64 content, or an attachment reference (image or file) previously returned by filesystem_pull — re-supply that exact reference to write its bytes back unchanged. Provide exactly one of content, image, or file. Creates missing parent directories by default. Requires approval unless requireApproval is off.',
+      'Upload a file: literal text/base64, or an attachment reference (image/file) from filesystem_pull re-supplied to write back unchanged. Exactly one of content/image/file. Creates missing parent directories by default. Requires approval unless requireApproval is off.',
     parameters: {
       ...sshOverrideParameter,
       remotePath: { type: 'string', description: 'Full destination path on the remote host.', required: true as const },
@@ -1163,7 +1161,7 @@ export function filesystemPushTool(services: ToolServices) {
       encoding: { type: 'string', enum: ['text', 'base64'] as const, description: 'How to interpret `content` (default text = UTF-8).' },
       image: {
         type: 'object',
-        description: 'An image attachment reference exactly as returned by filesystem_pull (or another tool), re-supplied to write its exact bytes back.',
+        description: 'Image attachment reference from filesystem_pull (or another tool), to write back unchanged.',
         properties: {
           attachmentId: { type: 'string', required: true as const },
           mediaType: { type: 'string', required: true as const },
@@ -1173,7 +1171,7 @@ export function filesystemPushTool(services: ToolServices) {
           name: { type: 'string' },
           originalDimensions: {
             type: 'object',
-            description: 'Present only when the attachment store downscaled this image on save: its input dimensions before that normalization.',
+            description: 'Original dimensions, present only if the attachment store downscaled the image on save.',
             properties: {
               width: { type: 'integer' },
               height: { type: 'integer' },
@@ -1185,7 +1183,7 @@ export function filesystemPushTool(services: ToolServices) {
       },
       file: {
         type: 'object',
-        description: 'A file attachment reference exactly as returned by filesystem_pull, re-supplied to write its exact bytes back.',
+        description: 'File attachment reference from filesystem_pull, to write back unchanged.',
         properties: {
           attachmentId: { type: 'string', required: true as const },
           name: { type: 'string', required: true as const },
@@ -1283,7 +1281,7 @@ export function moveTool(services: ToolServices) {
   return defineTool({
     name: 'move',
     description:
-      'Move the mouse (and, with `drag`, drag) inside an observed window on the remote Windows host, delivered entirely as posted window messages (WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP) — the real OS cursor never moves. Requires `basedOn`; fails if the remote screen changed since that observation. Honest limits: this reliably works for controls that react to simple mouse events (sliders, canvases, custom-drawn controls); it is NOT real OLE/shell drag-and-drop (e.g. dragging a file between two Explorer windows) — that needs actual SendInput-driven drag detection which posted messages cannot trigger. Requires approval unless the window is allowlisted.',
+      'Move the mouse (and, with `drag`, drag) inside an observed window, via posted messages only — the real cursor never moves. Requires `basedOn`; fails if the screen changed since. Works for controls reacting to simple mouse events; not real OS drag-and-drop. Requires approval unless the window is allowlisted.',
     parameters: {
       ...basedOnParameters,
       target: {
@@ -1299,7 +1297,7 @@ export function moveTool(services: ToolServices) {
       },
       drag: {
         type: 'object',
-        description: 'When given, drag from target to this destination instead of just moving. Exactly one of (toX, toY) or toElementId.',
+        description: 'Drag from target to this destination instead of moving. Exactly one of (toX, toY) or toElementId.',
         properties: {
           toX: { type: 'integer', description: 'Destination screen x coordinate.' },
           toY: { type: 'integer', description: 'Destination screen y coordinate.' },
@@ -1380,7 +1378,7 @@ export function waitForTool(services: ToolServices) {
   return defineTool({
     name: 'wait_for',
     description:
-      'Poll the remote Windows host roughly every 500ms until a condition is met or a timeout elapses, then return a fresh observation (same shape as screen_read) with observationId set for later actions. condition.kind "element": target names a window (windowId/windowTitle/processId) and match (name/automationId/controlType substring, at least one) names what to look for in its accessibility tree. condition.kind "window": match.title names a substring to look for across all top-level window titles. condition.kind "foreground": target names a window that must exist and be the foreground window. A timeout is NOT an error: the result carries met: false, timedOut: true, and whatever was last observed, so you can see what is actually on screen. Read-only: never needs approval.',
+      'Poll ~500ms until a condition is met or timeout, then return a fresh observation (like screen_read) with observationId. "element": target + match (name/automationId/controlType, ≥1) against the tree. "window": match.title across window titles. "foreground": target must be foreground. Timeout isn\'t an error — met: false, timedOut: true, plus the last observation. Read-only: never needs approval.',
     parameters: {
       ...sshOverrideParameter,
       condition: {
@@ -1390,7 +1388,7 @@ export function waitForTool(services: ToolServices) {
           kind: { type: 'string', enum: ['element', 'window', 'foreground'] as const, description: 'Condition kind.', required: true as const },
           target: {
             type: 'object',
-            description: 'Which window to watch (windowId, windowTitle, or processId). Required for kind "element" and "foreground"; ignored for kind "window".',
+            description: 'Window to watch; required for kind "element"/"foreground", ignored for kind "window".',
             properties: {
               windowId: { type: 'integer' },
               windowTitle: { type: 'string' },
@@ -1400,7 +1398,7 @@ export function waitForTool(services: ToolServices) {
           },
           match: {
             type: 'object',
-            description: 'Substring match fields (case-insensitive). kind "element": name/automationId/controlType (at least one). kind "window": title.',
+            description: 'Case-insensitive substring match: kind "element" uses name/automationId/controlType (one required); kind "window" uses title.',
             properties: {
               name: { type: 'string' },
               automationId: { type: 'string' },
@@ -1606,7 +1604,7 @@ export function clipboardTool(services: ToolServices) {
   return defineTool({
     name: 'clipboard',
     description:
-      'Get or set the remote clipboard text. action: "get" reads the current clipboard text (read-only, never needs approval). action: "set" replaces it with `text` — a mutating action, requires approval unless requireApproval is off.',
+      'Get or set the remote clipboard text. "get" is read-only. "set" replaces it with `text`, requires approval unless requireApproval is off.',
     parameters: {
       ...sshOverrideParameter,
       action: { type: 'string', enum: ['get', 'set'] as const, description: 'Whether to read or write the clipboard.', required: true as const },
@@ -1661,12 +1659,12 @@ export function processTool(services: ToolServices) {
   return defineTool({
     name: 'process',
     description:
-      'List running processes on the remote Windows host, or kill one or more by pid or by name. action: "list" is read-only (never needs approval). action: "kill" requires approval unless requireApproval is off.',
+      'List running processes, or kill one or more by pid/name. "list" is read-only. "kill" requires approval unless requireApproval is off.',
     parameters: {
       ...sshOverrideParameter,
       action: { type: 'string', enum: ['list', 'kill'] as const, description: 'Whether to list or kill processes.', required: true as const },
-      pid: { type: 'integer', description: 'Process id to kill. Exactly one of pid or name is required for action "kill".' },
-      name: { type: 'string', description: 'Process name to kill (every process with this name is killed). Exactly one of pid or name is required for action "kill".' },
+      pid: { type: 'integer', description: 'Process id to kill. Exactly one of pid or name required for "kill".' },
+      name: { type: 'string', description: 'Process name to kill (kills every match). Exactly one of pid or name required for "kill".' },
       force: { type: 'boolean', description: 'Force-kill (default false).' },
     },
     output: {
@@ -1752,7 +1750,7 @@ export function displayListTool(services: ToolServices) {
   return defineTool({
     name: 'display_list',
     description:
-      'Enumerate every monitor on the remote Windows desktop: index, screen-space rectangle, and whether it is the primary display. Read-only: never needs approval. Use a display index with screen_shot(wholeScreen: true, display: N) to capture one specific monitor, or its rect with screen_shot(region: {...}) to capture part of it.',
+      'Enumerate every monitor: index, rect, primary flag. Read-only: never needs approval. Use its index with screen_shot(wholeScreen: true, display: N), or its rect with screen_shot(region: {...}).',
     parameters: {
       ...sshOverrideParameter,
     },
@@ -1814,12 +1812,12 @@ export function notifyTool(services: ToolServices) {
   return defineTool({
     name: 'notify',
     description:
-      'Show a real Windows Action Center toast notification on the remote host (WinRT ToastNotificationManager — not a legacy balloon-tip popup). Uses the built-in Windows PowerShell AUMID by default so it works out of the box with no app registration; override with appId if a specific one is needed. Requires approval unless requireApproval is off.',
+      'Show a Windows Action Center toast (not a legacy balloon-tip). Uses the built-in PowerShell AUMID by default; override with appId. Requires approval unless requireApproval is off.',
     parameters: {
       ...sshOverrideParameter,
       title: { type: 'string', description: 'Toast title.', required: true as const },
       message: { type: 'string', description: 'Toast body text.', required: true as const },
-      appId: { type: 'string', description: 'AUMID to toast under (default: the plugin-configured notifyAppId, itself defaulting to the built-in Windows PowerShell AUMID).' },
+      appId: { type: 'string', description: 'AUMID to toast under (default: configured notifyAppId, else the built-in PowerShell AUMID).' },
     },
     output: {
       schema: {
@@ -1878,7 +1876,7 @@ export function multiActionTool(services: ToolServices) {
   return defineTool({
     name: 'multi_action',
     description:
-      'Run a batch of click/type sub-actions in sequence against ONE observed window on the remote Windows host (basedOn), in a single tool call. By default stops at the first failing step; continueOnError: true runs every step regardless. Each step is addressed and validated exactly like a standalone click/type call. For list/grid multi-selection, a click-kind step may set selectionMode ("select"/"add"/"remove"/"toggle") to invoke the UIA SelectionItem pattern directly instead of posting a click, when the target element supports it. Requires approval unless the window is allowlisted (one ask covers the whole batch).',
+      'Run click/type steps in sequence against ONE observed window (basedOn), in one call. Stops at the first failure unless continueOnError. Each step validates like a standalone click/type call. A click step\'s selectionMode ("select"/"add"/"remove"/"toggle") uses UIA SelectionItem instead of a posted click, if supported. Requires approval unless allowlisted (one ask covers the batch).',
     parameters: {
       ...basedOnParameters,
       steps: {
@@ -1895,7 +1893,7 @@ export function multiActionTool(services: ToolServices) {
             selectionMode: {
               type: 'string',
               enum: ['select', 'add', 'remove', 'toggle'] as const,
-              description: 'Click step only: apply UIA SelectionItem Select/AddToSelection/RemoveFromSelection instead of posting a click, when supported.',
+              description: 'Click step only: use UIA SelectionItem instead of posting a click, when supported.',
             },
             text: { type: 'string', description: 'Text to type (type step only, up to 10000 characters).' },
           },
@@ -2035,7 +2033,7 @@ export function windowControlTool(services: ToolServices) {
   return defineTool({
     name: 'window_control',
     description:
-      'Minimize, maximize, restore, move, resize, or close an observed window on the remote Windows host. Requires `basedOn`; fails if the remote screen changed since that observation. Requires approval unless the window is allowlisted.',
+      'Minimize, maximize, restore, move, resize, or close an observed window. Requires `basedOn`; fails if the screen changed since. Requires approval unless allowlisted.',
     parameters: {
       ...basedOnParameters,
       action: { type: 'string', enum: ['minimize', 'maximize', 'restore', 'move', 'resize', 'close'] as const, description: 'Window action.', required: true as const },
@@ -2112,7 +2110,7 @@ export function invokeTool(services: ToolServices) {
   return defineTool({
     name: 'invoke',
     description:
-      'Call a UI Automation control pattern method directly on an element of an observed window on the remote Windows host, instead of posting a synthetic click or keystroke. pattern: "invoke" (InvokePattern.Invoke), "toggle" (TogglePattern.Toggle), "expand"/"collapse" (ExpandCollapsePattern.Expand/Collapse), "select"/"addToSelection"/"removeFromSelection" (SelectionItemPattern), "scrollIntoView" (ScrollItemPattern.ScrollIntoView), "setValue" (ValuePattern.SetValue — requires a string `value`), "setRangeValue" (RangeValuePattern.SetValue — requires a numeric `value`). Fails with a clear error naming the pattern and the element\'s control type if the element does not support the requested pattern — never silently no-ops. Requires `basedOn`; fails if the remote screen changed since that observation. Requires approval unless the window is allowlisted.',
+      'Call a UI Automation pattern method on an element instead of a click or keystroke: invoke, toggle, expand/collapse, select/addToSelection/removeFromSelection, scrollIntoView, setValue (string), setRangeValue (number). Fails clearly (never no-ops) if unsupported. Requires `basedOn`; fails if the screen changed since. Requires approval unless allowlisted.',
     parameters: {
       ...basedOnParameters,
       elementId: { type: 'string', description: 'Element id from screen_read.', required: true as const },
@@ -2185,7 +2183,7 @@ export function readTextTool(services: ToolServices) {
   return defineTool({
     name: 'read_text',
     description:
-      'Read one text/document/edit element\'s full content and current text selection (if any) via the UI Automation Text pattern, on an observed window on the remote Windows host. Richer than the plain name/value screen_read already returns: the Text pattern exposes a document\'s full content (and current selection) even when it is far longer than what a plain Name/Value property would carry. Fails with a clear error naming the element\'s control type if it does not support the Text pattern. Requires `basedOn`; fails if the remote screen changed since that observation. Read-only: never needs approval.',
+      'Read a text/document/edit element\'s content and current selection via the UIA Text pattern — richer than screen_read\'s name/value. Fails clearly if unsupported. Requires `basedOn`; fails if the screen changed since. Read-only: never needs approval.',
     parameters: {
       ...basedOnParameters,
       elementId: { type: 'string', description: 'Text/document/edit element id from screen_read.', required: true as const },
@@ -2241,7 +2239,7 @@ export function readTableTool(services: ToolServices) {
   return defineTool({
     name: 'read_table',
     description:
-      'Read one grid/list/table element\'s structured cell data (row count, column count, cell text, and column headers when available) via the UI Automation Grid/GridItem/Table/TableItem patterns, on an observed window on the remote Windows host. Each cell prefers its ValuePattern value, falling back to its Name. Column headers are included only when the element supports TablePattern (omitted, not an error, when it supports only GridPattern). Cells are capped at the configured maxTableCells (a total-cell cap, not per-dimension); rowCount/columnCount are always reported truthfully even when cells was capped short of them, and `truncated: true` marks that. Fails with a clear error naming the element\'s control type if it supports neither pattern. Requires `basedOn`; fails if the remote screen changed since that observation. Read-only: never needs approval.',
+      'Read one grid/list/table element\'s cell data (rows, columns, text, headers if available) via UIA Grid/Table. Prefers ValuePattern, falls back to Name; headers need TablePattern. Capped at maxTableCells total (`truncated: true` if so; counts stay accurate). Fails clearly if neither pattern is supported. Requires `basedOn`; fails if the screen changed since. Read-only: never needs approval.',
     parameters: {
       ...basedOnParameters,
       elementId: { type: 'string', description: 'Grid/list/table element id from screen_read.', required: true as const },
@@ -2322,4 +2320,50 @@ export function allTools(services: ToolServices) {
     notifyTool(services),
     ...services.config.enablePowerShellTool ? [powershellTool(services)] : [],
   ]
+}
+
+/**
+ * `pc_control` — the sole tool this plugin registers at startup when
+ * `config.lazyToolLoading` is on (the default). Every tool `allTools()`
+ * returns costs prompt tokens on every single turn once registered, whether
+ * or not a conversation ever calls it, and most conversations only need a
+ * handful of the ~20 this plugin defines. Calling this once registers the
+ * rest for the remainder of this session; calling it again is a harmless
+ * no-op that just reports what's already loaded.
+ */
+export function pcControlTool(services: ToolServices) {
+  const { ctx } = services
+  let loaded = false
+  return defineTool({
+    name: 'pc_control',
+    description: 'Windows PC control over SSH (screen, input, apps, files, PowerShell). Call once to load the rest of the tools.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          alreadyLoaded: { type: 'boolean' },
+          tools: { type: 'array', items: { type: 'string' } },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { alreadyLoaded: boolean; tools: string[] }
+        const text = result.alreadyLoaded
+          ? `Already loaded. Available tools: ${result.tools.join(', ')}.`
+          : `Loaded ${result.tools.length} tools for this conversation: ${result.tools.join(', ')}.`
+        return [{ type: 'text', text }]
+      },
+    },
+    async execute() {
+      const names = allTools(services).map(tool => tool.name)
+      if (loaded) return { ok: true as const, alreadyLoaded: true as const, tools: names }
+      loaded = true
+      for (const tool of allTools(services)) {
+        ctx.effect(() => ctx.tools.register(tool), `dsh-windows-remote-ssh: ${tool.name} tool`)
+      }
+      return { ok: true as const, alreadyLoaded: false as const, tools: names }
+    },
+  })
 }
