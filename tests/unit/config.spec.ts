@@ -83,6 +83,18 @@ describe('resolveConfig', () => {
     expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, autoApproveWindows: ['[unclosed'] })).toThrow(/autoApproveWindows/u)
   })
 
+  it('compiles staleCheckPixelsExemptWindows into matchers', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, staleCheckPixelsExemptWindows: ['VRoid Studio'] })
+    expect(resolved.staleCheckPixelsExemptMatchers).toHaveLength(1)
+    expect(resolved.staleCheckPixelsExemptMatchers[0]!.test('VRoid Studio 2.14.0')).toBe(true)
+  })
+
+  it('rejects an invalid staleCheckPixelsExemptWindows regex', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, staleCheckPixelsExemptWindows: ['[unclosed'] })).toThrow(/staleCheckPixelsExemptWindows/u)
+  })
+
   it('treats an explicit null the same as an omitted optional ssh field (the loader/YAML shape, not just TS-typed undefined)', () => {
     clearSshEnv()
     // Mirrors what the harness's own YAML template (and this plugin's

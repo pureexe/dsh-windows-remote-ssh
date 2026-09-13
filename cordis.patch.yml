@@ -89,6 +89,15 @@
         # stale-state boundary). Disable only for tooling that mutates the
         # remote screen faster than the check can run.
         staleCheckPixels: true
+        # Window title or executable-path regexes exempted from
+        # staleCheckPixels (identity, and the tree check unless also
+        # skipped, still apply). For a window whose pixels never settle on
+        # their own - a live 3D viewport, a video player, a game - no
+        # amount of re-observing right before acting ever produces a
+        # matching hash, so staleCheckPixels permanently refuses every
+        # coordinate-based click/key against it. Allowlist that window here
+        # instead of turning the check off everywhere.
+        staleCheckPixelsExemptWindows: []
         # Maximum age in ms of an observation that an action may still base
         # on (1000..600000). Older observations are refused and must be
         # re-observed. Default 300000 (5 minutes) gives the model room for

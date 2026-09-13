@@ -181,6 +181,17 @@ export interface Config {
   staleCheckTree?: boolean
   /** Compare a fresh pixel hash before every action (default true; the stale-state boundary). */
   staleCheckPixels?: boolean
+  /**
+   * Window title or executable-path regexes exempted from `staleCheckPixels`
+   * (default []; identity and, unless also skipped, the tree check still
+   * apply). For a target whose pixels never stop changing on their own —
+   * a live 3D viewport, a video player, a game — no amount of re-observing
+   * right before acting ever produces a matching hash, so `staleCheckPixels`
+   * turns every coordinate-based `click`/`key` against it into a permanent
+   * refusal. Allowlist that window by title/exe here instead of disabling
+   * the check for every other window too.
+   */
+  staleCheckPixelsExemptWindows?: string[]
   /** Maximum age in ms of an observation that an action may still base on (default 300000, i.e. 5 minutes). */
   maxObservationAgeMs?: number
   /** Cap on cached observations (default 8). */
@@ -273,6 +284,7 @@ export interface ResolvedConfig {
   maxScreenshotSide: number
   staleCheckTree: boolean
   staleCheckPixels: boolean
+  staleCheckPixelsExemptMatchers: ReadonlyArray<RegExp>
   maxObservationAgeMs: number
   maxCachedObservations: number
   maxElements: number
@@ -314,6 +326,7 @@ export const Config: z<Config> = z.object({
   maxScreenshotSide: z.number().min(MIN_SCREENSHOT_SIDE).max(MAX_SCREENSHOT_SIDE).default(DEFAULT_MAX_SCREENSHOT_SIDE),
   staleCheckTree: z.boolean().default(true),
   staleCheckPixels: z.boolean().default(true),
+  staleCheckPixelsExemptWindows: z.array(z.string()).default([]),
   maxObservationAgeMs: z.number().min(MIN_OBSERVATION_AGE_MS).max(MAX_OBSERVATION_AGE_MS).default(DEFAULT_MAX_OBSERVATION_AGE_MS),
   maxCachedObservations: z.number().min(1).max(MAX_CACHED_OBSERVATIONS).default(DEFAULT_MAX_CACHED_OBSERVATIONS),
   maxElements: z.number().min(1).max(MAX_ELEMENTS).default(DEFAULT_MAX_ELEMENTS),
@@ -338,11 +351,11 @@ function invalid(field: string, detail: string): never {
 }
 
 /** Compile one allowlist pattern; an invalid regex fails at load, not at match time. */
-function compileMatcher(source: string, index: number): RegExp {
+function compileMatcher(field: string, source: string, index: number): RegExp {
   try {
     return new RegExp(source, 'iu')
   } catch {
-    invalid('autoApproveWindows', `entry ${index} (${JSON.stringify(source)}) is not a valid regular expression`)
+    invalid(field, `entry ${index} (${JSON.stringify(source)}) is not a valid regular expression`)
   }
 }
 
@@ -542,7 +555,7 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
   const requireApproval = config?.requireApproval ?? true
   if (typeof requireApproval !== 'boolean') invalid('requireApproval', 'must be a boolean')
 
-  const autoApproveMatchers = (config?.autoApproveWindows ?? []).map(compileMatcher)
+  const autoApproveMatchers = (config?.autoApproveWindows ?? []).map((source, index) => compileMatcher('autoApproveWindows', source, index))
   const auditSessionEvents = config?.auditSessionEvents ?? true
   if (typeof auditSessionEvents !== 'boolean') invalid('auditSessionEvents', 'must be a boolean')
 
@@ -572,6 +585,9 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
 
   const staleCheckPixels = config?.staleCheckPixels ?? true
   if (typeof staleCheckPixels !== 'boolean') invalid('staleCheckPixels', 'must be a boolean')
+
+  const staleCheckPixelsExemptMatchers = (config?.staleCheckPixelsExemptWindows ?? [])
+    .map((source, index) => compileMatcher('staleCheckPixelsExemptWindows', source, index))
 
   const maxObservationAgeMs = config?.maxObservationAgeMs ?? DEFAULT_MAX_OBSERVATION_AGE_MS
   if (!Number.isFinite(maxObservationAgeMs) || maxObservationAgeMs < MIN_OBSERVATION_AGE_MS || maxObservationAgeMs > MAX_OBSERVATION_AGE_MS) {
@@ -660,6 +676,7 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
     maxScreenshotSide,
     staleCheckTree,
     staleCheckPixels,
+    staleCheckPixelsExemptMatchers: Object.freeze(staleCheckPixelsExemptMatchers),
     maxObservationAgeMs,
     maxCachedObservations,
     maxElements,

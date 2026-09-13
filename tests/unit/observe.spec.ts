@@ -83,6 +83,41 @@ describe('ObservationStore', () => {
     expect(verdict.ok).toBe(true)
   })
 
+  it('ignores pixel drift for a window matching staleCheckPixelsExemptWindows by title (e.g. a live 3D viewport that never settles)', () => {
+    const config = resolveConfig({
+      ssh: { host: 'h', user: 'u', password: 'p' },
+      staleCheckPixelsExemptWindows: ['VRoid Studio'],
+    })
+    const store = new ObservationStore(config)
+    const record = store.record(snapshot({ title: 'VRoid Studio 2.14.0' }), target)
+    const verdict = store.verify(record, snapshot({ title: 'VRoid Studio 2.14.0', shotHash: 'different' }))
+    expect(verdict.ok).toBe(true)
+  })
+
+  it('ignores pixel drift for a window matching staleCheckPixelsExemptWindows by executable path', () => {
+    const config = resolveConfig({
+      ssh: { host: 'h', user: 'u', password: 'p' },
+      staleCheckPixelsExemptWindows: ['VRoidStudio\\.exe$'],
+    })
+    const store = new ObservationStore(config)
+    const vroid = { executablePath: 'C:\\Users\\me\\AppData\\Local\\Programs\\VRoidStudio\\VRoidStudio.exe' }
+    const record = store.record(snapshot(vroid), target)
+    const verdict = store.verify(record, snapshot({ ...vroid, shotHash: 'different' }))
+    expect(verdict.ok).toBe(true)
+  })
+
+  it('still refuses on pixel drift for a window that does not match staleCheckPixelsExemptWindows', () => {
+    const config = resolveConfig({
+      ssh: { host: 'h', user: 'u', password: 'p' },
+      staleCheckPixelsExemptWindows: ['VRoid Studio'],
+    })
+    const store = new ObservationStore(config)
+    const record = store.record(snapshot(), target)
+    const verdict = store.verify(record, snapshot({ shotHash: 'different' }))
+    expect(verdict.ok).toBe(false)
+    if (!verdict.ok) expect(verdict.code).toBe('STALE_PIXELS')
+  })
+
   it('refuses when the window identity changed', () => {
     const store = new ObservationStore(baseConfig)
     const record = store.record(snapshot(), target)

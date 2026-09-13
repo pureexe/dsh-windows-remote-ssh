@@ -114,7 +114,8 @@ export class ObservationStore {
    * Compare a fresh re-observation against the cited record. The verdict is
    * `ok` only when identity (window/pid/exe/title/class/rect), the tree hash
    * (when `checkTree` is true and `staleCheckTree` is on), and the pixel hash
-   * (when `staleCheckPixels` is on) all still match, and the record is not
+   * (when `staleCheckPixels` is on and the window doesn't match
+   * `staleCheckPixelsExemptMatchers`) all still match, and the record is not
    * older than `maxObservationAgeMs`.
    *
    * @param record - the observation the action cites.
@@ -159,7 +160,9 @@ export class ObservationStore {
         detail: `the accessibility tree of window ${record.windowId} changed since observation ${record.id}`,
       }
     }
-    if (this.config.staleCheckPixels && fresh.shotHash !== record.shotHash) {
+    const pixelCheckExempt = this.config.staleCheckPixelsExemptMatchers.some(matcher =>
+      matcher.test(fresh.title) || (fresh.executablePath !== null && matcher.test(fresh.executablePath)))
+    if (this.config.staleCheckPixels && !pixelCheckExempt && fresh.shotHash !== record.shotHash) {
       return {
         ok: false,
         code: 'STALE_PIXELS',

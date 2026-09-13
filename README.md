@@ -431,6 +431,15 @@ re-verifying the target), and to those you can set `staleCheckTree: false`
 deployment-wide if a target window's content drifts too fast even for that.
 Identity and the observation-age check always apply regardless.
 
+`staleCheckPixels` (default `true`) has the same trade-off for a window whose
+pixels never stop changing on their own — a live 3D viewport, a video player,
+a game — where no amount of re-observing right before acting ever produces a
+matching hash, so it permanently refuses every coordinate-based `click`/`key`
+against that window. Rather than disabling the check everywhere, allowlist
+that one window by title/exe regex in `staleCheckPixelsExemptWindows`
+(default `[]`); identity (and the tree check, unless also disabled) still
+apply to it.
+
 ## Configuration
 
 All fields live under one `Config` object (Schemastery-validated; invalid
@@ -438,7 +447,7 @@ values fail the profile load loudly, not at call time). See the fully
 commented `cordis.patch.yml` for the complete list and defaults:
 `ssh.*`, `lazyToolLoading`, `requireApproval`, `autoApproveWindows`, `auditSessionEvents`,
 `focusFallback`, `imageMode`, `connectTimeoutMs`, `helperTimeoutMs`,
-`maxScreenshotSide`, `staleCheckTree`, `staleCheckPixels`, `maxObservationAgeMs`,
+`maxScreenshotSide`, `staleCheckTree`, `staleCheckPixels`, `staleCheckPixelsExemptWindows`, `maxObservationAgeMs`,
 `maxCachedObservations`, `maxElements`, `maxTreeDepth`, `maxTextLength`,
 `rollbackEnabled`, `enablePowerShellTool`, `powerShellTimeoutMs`,
 `maxPowerShellOutputLength`, `maxFilesystemTransferBytes`,
