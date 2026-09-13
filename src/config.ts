@@ -105,6 +105,17 @@ export interface Config {
   helperTimeoutMs?: number
   /** Longest side of a captured screenshot in pixels (default 1600). */
   maxScreenshotSide?: number
+  /**
+   * Compare the accessibility tree of the whole window before every action
+   * and refuse if anything in it differs from the cited observation — not
+   * just the targeted element (default true; the stale-state boundary).
+   * Disable for a target whose window has any live-updating content
+   * elsewhere (a clock, a status indicator, a tooltip, scrollbar position)
+   * that would otherwise trip this on every action even though the element
+   * you're addressing hasn't changed. Identity (window/pid/exe/title/class/
+   * rect) and the observation-age check still apply regardless.
+   */
+  staleCheckTree?: boolean
   /** Compare a fresh pixel hash before every action (default true; the stale-state boundary). */
   staleCheckPixels?: boolean
   /** Maximum age in ms of an observation that an action may still base on (default 300000, i.e. 5 minutes). */
@@ -137,6 +148,7 @@ export interface ResolvedConfig {
   connectTimeoutMs: number
   helperTimeoutMs: number
   maxScreenshotSide: number
+  staleCheckTree: boolean
   staleCheckPixels: boolean
   maxObservationAgeMs: number
   maxCachedObservations: number
@@ -166,6 +178,7 @@ export const Config: z<Config> = z.object({
   connectTimeoutMs: z.number().min(1).max(MAX_CONNECT_TIMEOUT_MS).default(DEFAULT_CONNECT_TIMEOUT_MS),
   helperTimeoutMs: z.number().min(1).max(MAX_HELPER_TIMEOUT_MS).default(DEFAULT_HELPER_TIMEOUT_MS),
   maxScreenshotSide: z.number().min(MIN_SCREENSHOT_SIDE).max(MAX_SCREENSHOT_SIDE).default(DEFAULT_MAX_SCREENSHOT_SIDE),
+  staleCheckTree: z.boolean().default(true),
   staleCheckPixels: z.boolean().default(true),
   maxObservationAgeMs: z.number().min(MIN_OBSERVATION_AGE_MS).max(MAX_OBSERVATION_AGE_MS).default(DEFAULT_MAX_OBSERVATION_AGE_MS),
   maxCachedObservations: z.number().min(1).max(MAX_CACHED_OBSERVATIONS).default(DEFAULT_MAX_CACHED_OBSERVATIONS),
@@ -407,6 +420,9 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
     invalid('maxScreenshotSide', `must be an integer between ${MIN_SCREENSHOT_SIDE} and ${MAX_SCREENSHOT_SIDE}`)
   }
 
+  const staleCheckTree = config?.staleCheckTree ?? true
+  if (typeof staleCheckTree !== 'boolean') invalid('staleCheckTree', 'must be a boolean')
+
   const staleCheckPixels = config?.staleCheckPixels ?? true
   if (typeof staleCheckPixels !== 'boolean') invalid('staleCheckPixels', 'must be a boolean')
 
@@ -448,6 +464,7 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
     connectTimeoutMs,
     helperTimeoutMs,
     maxScreenshotSide,
+    staleCheckTree,
     staleCheckPixels,
     maxObservationAgeMs,
     maxCachedObservations,

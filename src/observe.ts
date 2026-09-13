@@ -143,7 +143,7 @@ export class ObservationStore {
         detail: `window ${record.windowId} no longer matches observation ${record.id} (title/class/process or rect changed)`,
       }
     }
-    if (fresh.treeHash !== record.treeHash) {
+    if (this.config.staleCheckTree && fresh.treeHash !== record.treeHash) {
       return {
         ok: false,
         code: 'STALE_TREE',

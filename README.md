@@ -150,11 +150,18 @@ replay against whichever host their cited `basedOn` observation came from.
 Every mutating action (`click`/`type`/`scroll`/`key`/`app_launch`) must cite
 a `basedOn` observation returned by `screen_shot`/`screen_read`. Before
 acting, the plugin re-observes the window over SSH and refuses if the window
-identity, its accessibility tree, or (when `staleCheckPixels` is on) its
-pixels changed since that observation — so the model can't act on a screen
-it no longer has an accurate picture of. It also captures the target
-process's identity before and after the action and refuses if it changed
-mid-flight.
+identity, (when `staleCheckTree` is on) its accessibility tree, or (when
+`staleCheckPixels` is on) its pixels changed since that observation — so the
+model can't act on a screen it no longer has an accurate picture of. It also
+captures the target process's identity before and after the action and
+refuses if it changed mid-flight.
+
+`staleCheckTree` compares the *whole* window's tree, not just the element
+being addressed — any live-updating content elsewhere in that window (a
+clock, a status indicator, a tooltip, scrollbar position) will trip it on
+every action even though the element you're addressing never changed. Set
+it `false` for a target with content like that; identity and the
+observation-age check still apply regardless.
 
 ## Configuration
 
@@ -163,7 +170,7 @@ values fail the profile load loudly, not at call time). See the fully
 commented `cordis.patch.yml` for the complete list and defaults:
 `ssh.*`, `requireApproval`, `autoApproveWindows`, `auditSessionEvents`,
 `focusFallback`, `imageMode`, `connectTimeoutMs`, `helperTimeoutMs`,
-`maxScreenshotSide`, `staleCheckPixels`, `maxObservationAgeMs`,
+`maxScreenshotSide`, `staleCheckTree`, `staleCheckPixels`, `maxObservationAgeMs`,
 `maxCachedObservations`, `maxElements`, `maxTreeDepth`, `maxTextLength`,
 `rollbackEnabled`.
 

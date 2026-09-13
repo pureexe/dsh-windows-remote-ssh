@@ -45,6 +45,14 @@ describe('ObservationStore', () => {
     if (!verdict.ok) expect(verdict.code).toBe('STALE_TREE')
   })
 
+  it('ignores tree drift when staleCheckTree is off (e.g. a clock/tooltip elsewhere in the same window)', () => {
+    const config = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, staleCheckTree: false })
+    const store = new ObservationStore(config)
+    const record = store.record(snapshot(), target)
+    const verdict = store.verify(record, snapshot({ treeHash: 'different' }))
+    expect(verdict.ok).toBe(true)
+  })
+
   it('refuses when the pixels changed and staleCheckPixels is on', () => {
     const store = new ObservationStore(baseConfig)
     const record = store.record(snapshot(), target)

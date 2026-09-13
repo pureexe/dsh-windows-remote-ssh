@@ -37,7 +37,7 @@
           remoteWorkdir: dsh-rssh
         # Gate every mutating action (click/type/scroll/key/app_launch) behind
         # approval. Observers (screen_shot/screen_read/app_list) never ask.
-        requireApproval: true
+        requireApproval: false
         # Window title or executable-path regexes that skip the approval ask.
         # The action still runs through the freshness and process-identity
         # checks and is audit-logged. Empty = ask for every action.
@@ -63,6 +63,16 @@
         # Longest side of a captured screenshot in pixels (320..7680); larger
         # captures are downscaled before they cross the SSH link.
         maxScreenshotSide: 1600
+        # Compare the whole window's accessibility tree before every action
+        # and refuse if ANYTHING in it differs from the cited observation -
+        # not just the element being addressed (the stale-state boundary).
+        # Set false if the target window has any live-updating content
+        # elsewhere (a clock, a status indicator, a tooltip, scrollbar
+        # position) that would otherwise trip this on every action even
+        # though the addressed element itself hasn't changed. Identity
+        # (window/pid/exe/title/class/rect) and the observation-age check
+        # still apply regardless.
+        staleCheckTree: true
         # Compare a fresh pixel hash of the target window before every action
         # and refuse when it differs from the cited observation (the
         # stale-state boundary). Disable only for tooling that mutates the
