@@ -34,7 +34,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ActionExecutor } from './actions.ts'
-import { MAX_SCREENSHOT_SIDE, MAX_WAIT_FOR_TIMEOUT_MS, MIN_SCREENSHOT_SIDE, MIN_WAIT_FOR_TIMEOUT_MS, resolveSshTarget, type ResolvedConfig, type ResolvedSshConfig, type SshConfig } from './config.ts'
+import { MAX_POWERSHELL_TIMEOUT_MS, MAX_SCREENSHOT_SIDE, MAX_WAIT_FOR_TIMEOUT_MS, MIN_SCREENSHOT_SIDE, MIN_WAIT_FOR_TIMEOUT_MS, resolveSshTarget, type ResolvedConfig, type ResolvedSshConfig, type SshConfig } from './config.ts'
 import { appendAuditEvent, OBSERVED_EVENT, type ObservedEvent } from './events.ts'
 import { detectImageMediaType, looksLikeText } from './filesystem.ts'
 import { ObservationStore } from './observe.ts'
@@ -964,7 +964,7 @@ export function powershellTool(services: ToolServices) {
     parameters: {
       ...sshOverrideParameter,
       script: { type: 'string', description: 'The PowerShell script/command(s) to run on the remote host.', required: true as const },
-      timeoutMs: { type: 'integer', description: 'Timeout for this script in milliseconds (default from plugin config; the process is killed if it runs longer).' },
+      timeoutMs: { type: 'integer', description: `Timeout for this script in milliseconds (1-${MAX_POWERSHELL_TIMEOUT_MS}; default from plugin config). The process is killed if it runs longer. Raise this for a script you expect to genuinely take a while (e.g. a deep recursive file search) - the surrounding transport waits at least this long for a response.` },
     },
     output: {
       schema: {
@@ -988,11 +988,19 @@ export function powershellTool(services: ToolServices) {
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
-    timeoutMs: config.powerShellTimeoutMs + config.connectTimeoutMs + 15_000,
+    // Static budget for the harness's own tool-call timeout - this can't
+    // depend on the per-call `timeoutMs` argument (declared once, not a
+    // function of args), so it must cover the largest value a call could
+    // legitimately request (MAX_POWERSHELL_TIMEOUT_MS), not just the
+    // configured default.
+    timeoutMs: MAX_POWERSHELL_TIMEOUT_MS + config.connectTimeoutMs + 15_000,
     async execute(args, exec) {
       const parsed = args as { script: string; timeoutMs?: number; ssh?: SshConfig }
       if (parsed.script.trim() === '') {
         throw new Error('powershell script must not be empty')
+      }
+      if (parsed.timeoutMs !== undefined && (!Number.isFinite(parsed.timeoutMs) || parsed.timeoutMs < 1 || parsed.timeoutMs > MAX_POWERSHELL_TIMEOUT_MS)) {
+        throw new Error(`powershell timeoutMs must be a finite number between 1 and ${MAX_POWERSHELL_TIMEOUT_MS}`)
       }
       const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
       const timeoutMs = parsed.timeoutMs ?? config.powerShellTimeoutMs

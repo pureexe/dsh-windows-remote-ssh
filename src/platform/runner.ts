@@ -301,7 +301,17 @@ export class SshHelperBackend {
    * task writes — the standard workaround for driving a Windows GUI over
    * plain SSH.
    */
-  async invoke(target: ResolvedSshConfig, op: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+  /**
+   * @param minWaitMs - floor on how long to poll for the response, when this
+   * particular call is allowed to take longer than the general
+   * `config.helperTimeoutMs` budget (currently only `powershell`, whose
+   * script gets its own, separately configurable `timeoutMs` that can
+   * legitimately exceed `helperTimeoutMs` - without this, a script that
+   * takes, say, 45s but was given a 60s allowance would still be cut off by
+   * the generic 30s default, even though the helper itself was never going
+   * to give up on it that early).
+   */
+  async invoke(target: ResolvedSshConfig, op: string, args: Record<string, unknown>, signal?: AbortSignal, minWaitMs?: number): Promise<unknown> {
     const { ssh, bootstrap } = this.connectionFor(target)
     const layout = await bootstrap.ensure()
     const requestId = randomUUID()
@@ -322,7 +332,7 @@ export class SshHelperBackend {
       args,
     }
 
-    const deadline = AbortSignal.timeout(this.config.helperTimeoutMs)
+    const deadline = AbortSignal.timeout(Math.max(this.config.helperTimeoutMs, minWaitMs ?? 0))
     const fused = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
 
     const cleanup = (): void => {
@@ -628,11 +638,15 @@ class TargetedBackend implements DesktopBackend {
   }
 
   async powershell(script: string, timeoutMs: number, signal?: AbortSignal): Promise<PowerShellOutcome> {
+    // The response can't show up before the helper's own script timeout
+    // elapses (plus the time to actually kill/collect it) - poll at least
+    // that long, not just the generic helperTimeoutMs.
+    const minWaitMs = timeoutMs + 15_000
     const result = await this.pool.invoke(this.target, 'powershell', {
       script,
       timeoutMs,
       maxOutputLength: this.config.maxPowerShellOutputLength,
-    }, signal)
+    }, signal, minWaitMs)
     const record = expectRecordValue(result, 'powershell')
     return {
       exitCode: expectNumber(record, 'exitCode', 'powershell'),

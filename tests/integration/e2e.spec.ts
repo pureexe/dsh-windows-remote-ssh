@@ -191,6 +191,15 @@ describe.skipIf(!hasTarget)('remote Windows host over SSH (live integration)', (
     await expect(backend.powershell('Start-Sleep -Seconds 30', 1_500)).rejects.toThrow(/did not finish within/iu)
   })
 
+  it('a script allowed to run longer than helperTimeoutMs still gets its response (regression: the SFTP response-poll deadline used to ignore a call\'s own larger timeoutMs, always waiting only helperTimeoutMs regardless - a script that legitimately took longer than that, but well within its own requested allowance, would fail with "produced no response before the deadline" even though the helper was never going to give up on it that early)', async () => {
+    // config.helperTimeoutMs is 45_000 for this test file (see beforeAll) -
+    // this script deliberately runs longer than that, within a larger
+    // explicit timeoutMs.
+    const outcome = await backend.powershell('Start-Sleep -Seconds 47; Write-Output "dsh-long-script-marker"', 55_000)
+    expect(outcome.exitCode).toBe(0)
+    expect(outcome.stdout).toContain('dsh-long-script-marker')
+  }, 90_000)
+
   it('pushes and pulls a text file round-trip', async () => {
     const tempDir = (await backend.powershell('Write-Output $env:TEMP', 10_000)).stdout.trim()
     const remotePath = `${tempDir}\\dsh-fs-e2e-${Date.now()}.txt`
