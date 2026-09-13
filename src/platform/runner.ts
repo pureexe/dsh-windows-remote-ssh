@@ -30,6 +30,7 @@ import {
   type ElementInfo,
   type HelperRequest,
   type HelperResponse,
+  type InvokePatternRequest,
   type KeyRequest,
   type LaunchOutcome,
   type MoveRequest,
@@ -40,6 +41,8 @@ import {
   type Rect,
   type Screenshot,
   type ScrollRequest,
+  type TableReadResult,
+  type TextReadResult,
   type Tree,
   type WindowControlRequest,
   type WindowInfo,
@@ -191,6 +194,45 @@ function expectActionOutcome(value: unknown, op: string): ActionOutcome {
     processAfter: expectProcessFacts(record['processAfter'], op),
     ...restored !== undefined ? { restored } : {},
     ...detail !== undefined ? { detail } : {},
+  }
+}
+
+/** Validate one helper `read_text` result. */
+function expectTextReadResult(value: unknown, op: string): TextReadResult {
+  const record = expectRecordValue(value, op)
+  const text = expectString(record, 'text', op)
+  const selectionText = record['selectionText']
+  if (selectionText !== undefined && typeof selectionText !== 'string') {
+    throw new RemoteSshError(`helper "${op}" returned a non-string selectionText`, 'BAD_HELPER_RESPONSE')
+  }
+  return {
+    text,
+    truncated: record['truncated'] === true,
+    ...selectionText !== undefined ? { selectionText } : {},
+  }
+}
+
+/** Validate one helper `read_table` result. */
+function expectTableReadResult(value: unknown, op: string): TableReadResult {
+  const record = expectRecordValue(value, op)
+  const cellsRaw = record['cells']
+  if (!Array.isArray(cellsRaw) || cellsRaw.some(row => !Array.isArray(row) || row.some(cell => typeof cell !== 'string'))) {
+    throw new RemoteSshError(`helper "${op}" returned malformed cells`, 'BAD_HELPER_RESPONSE')
+  }
+  const columnHeadersRaw = record['columnHeaders']
+  let columnHeaders: string[] | undefined
+  if (columnHeadersRaw !== undefined) {
+    if (!Array.isArray(columnHeadersRaw) || columnHeadersRaw.some(item => typeof item !== 'string')) {
+      throw new RemoteSshError(`helper "${op}" returned malformed columnHeaders`, 'BAD_HELPER_RESPONSE')
+    }
+    columnHeaders = columnHeadersRaw as string[]
+  }
+  return {
+    rowCount: expectNumber(record, 'rowCount', op),
+    columnCount: expectNumber(record, 'columnCount', op),
+    truncated: record['truncated'] === true,
+    cells: cellsRaw as string[][],
+    ...columnHeaders !== undefined ? { columnHeaders } : {},
   }
 }
 
@@ -535,6 +577,21 @@ class TargetedBackend implements DesktopBackend {
   async windowControl(request: WindowControlRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome> {
     const result = await this.pool.invoke(this.target, 'windowControl', { request, focusFallback }, signal)
     return expectActionOutcome(result, 'windowControl')
+  }
+
+  async invokePattern(request: InvokePatternRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome> {
+    const result = await this.pool.invoke(this.target, 'invokePattern', { request, focusFallback }, signal)
+    return expectActionOutcome(result, 'invokePattern')
+  }
+
+  async readText(windowId: number, elementId: string, signal?: AbortSignal): Promise<TextReadResult> {
+    const result = await this.pool.invoke(this.target, 'readText', { windowId, elementId, maxLength: this.config.maxReadTextLength }, signal)
+    return expectTextReadResult(result, 'readText')
+  }
+
+  async readTable(windowId: number, elementId: string, signal?: AbortSignal): Promise<TableReadResult> {
+    const result = await this.pool.invoke(this.target, 'readTable', { windowId, elementId, maxCells: this.config.maxTableCells }, signal)
+    return expectTableReadResult(result, 'readTable')
   }
 
   async apps(signal?: AbortSignal): Promise<AppInfo[]> {

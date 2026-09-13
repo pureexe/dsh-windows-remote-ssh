@@ -153,6 +153,9 @@ silently guesses or hangs.
 | `clipboard` (set) | | Yes | Replace the remote clipboard text |
 | `process` (kill) | | Yes | Kill one or more processes by pid or name |
 | `notify` | | Yes | Show a real Windows Action Center toast notification |
+| `invoke` | | Yes | Call a UIA control pattern method directly on an element (Invoke/Toggle/ExpandCollapse/SelectionItem/ScrollItem/Value/RangeValue) |
+| `read_text` | ✅ | — | Read an element's full content + current selection via the UIA Text pattern |
+| `read_table` | ✅ | — | Read a grid/table element's structured cell data via the Grid/Table patterns |
 | `powershell` | | Yes | Run an arbitrary script with full user privileges — off by default, see below |
 
 ### `filesystem_pull` / `filesystem_push` — move files between the two machines
@@ -308,6 +311,63 @@ applies everywhere else. `app_list`'s window entries (and the underlying
 `WindowInfo` shape) now also carry `minimized`/`maximized` booleans
 (`IsIconic`/`IsZoomed`), at no extra cost.
 
+### `invoke` — direct UIA pattern-based control interaction
+
+Instead of posting a synthetic click or keystroke, `invoke` calls the target
+element's own UI Automation pattern method directly — more reliable for a
+control that reacts to its real pattern method but ignores posted input.
+Always addressed by `elementId` (never coordinates: this tool always targets
+a specific element). `pattern` is one of:
+
+- `'invoke'` — `InvokePattern.Invoke()`
+- `'toggle'` — `TogglePattern.Toggle()`
+- `'expand'` / `'collapse'` — `ExpandCollapsePattern.Expand()`/`.Collapse()`
+- `'select'` / `'addToSelection'` / `'removeFromSelection'` —
+  `SelectionItemPattern.Select()`/`.AddToSelection()`/`.RemoveFromSelection()`
+- `'scrollIntoView'` — `ScrollItemPattern.ScrollIntoView()`
+- `'setValue'` — `ValuePattern.SetValue(string)`, requires a string `value`
+- `'setRangeValue'` — `RangeValuePattern.SetValue(double)`, requires a
+  numeric `value`
+
+If the addressed element doesn't support the requested pattern, `invoke`
+fails with a clear error naming the pattern and the element's control type —
+it never silently no-ops. Like elementId-addressed `click`/`type`, the
+helper re-resolves the element by its UIA RuntimeId immediately before
+acting, so the whole-window tree hash adds no safety here. Mutating: gated
+by approval like `click`/`type`.
+
+### `read_text` / `read_table` — structured content via the Text/Grid/Table patterns
+
+Two read-only tools that expose UI Automation content richer than the plain
+`Name`/`Value` `screen_read` already returns:
+
+- `read_text(basedOn, elementId)` reads one text/document/edit element's full
+  content via `TextPattern.DocumentRange.GetText(-1)`, plus its current
+  selection's text (if any) via `TextPattern.GetSelection()`. The returned
+  text is truncated at `maxReadTextLength` (default 20000, distinct from the
+  much shorter `maxTextLength`, which is for short sanitized labels like
+  titles — not document bodies), with `truncated` reporting whether that
+  happened. Fails with a clear error naming the control type if the element
+  doesn't support the Text pattern (it never silently falls back to the
+  plain `Name`/`Value` already available via `screen_read`).
+- `read_table(basedOn, elementId)` reads one grid/list/table element's
+  structured cell data via `GridPattern`/`GridPattern.GetItem(row, col)`:
+  `rowCount`/`columnCount`, and cell text (preferring each cell's
+  `ValuePattern.Value`, falling back to its `Name`). Column headers come from
+  `TablePattern.GetColumnHeaders()` when the element also supports
+  `TablePattern` — omitted (not an error) when it supports only
+  `GridPattern`. Cells are capped at `maxTableCells` (default 500, max 5000
+  — a *total*-cell cap, not per-dimension); `rowCount`/`columnCount` are
+  always reported truthfully even when `cells` was capped short of them, and
+  `truncated: true` marks that. Fails with a clear error naming the control
+  type if the element supports neither pattern.
+
+Both are pure observers: read-only, never gated by approval — the same
+policy tier as `screen_read`/`app_list`. They still cite a `basedOn`
+observation and confirm the window's identity hasn't changed underneath it
+before reading, the same freshness reasoning every `basedOn`-taking tool
+applies, just without an approval ask.
+
 ### `powershell` — the escape hatch (off by default)
 
 `powershell` runs any script on the remote host with the full privileges of
@@ -342,9 +402,9 @@ to giving the model a terminal.
 `screen_shot`/`screen_read`/`app_list`/`app_launch`/`filesystem_pull`/`filesystem_push`/`display_list`/`wait_for`/`clipboard`/`process`/`notify`/`powershell`
 each accept an optional `ssh` argument (see **Supplying the SSH target**
 above) for deployments with no configured default.
-`click`/`type`/`scroll`/`key`/`move`/`multi_action`/`window_control` never
-take one — they replay against whichever host their cited `basedOn`
-observation came from.
+`click`/`type`/`scroll`/`key`/`move`/`multi_action`/`window_control`/`invoke`/
+`read_text`/`read_table` never take one — they replay against whichever host
+their cited `basedOn` observation came from.
 
 Every mutating action (`click`/`type`/`scroll`/`key`/`app_launch`) must cite
 a `basedOn` observation returned by `screen_shot`/`screen_read`. Before
@@ -380,7 +440,7 @@ commented `cordis.patch.yml` for the complete list and defaults:
 `rollbackEnabled`, `enablePowerShellTool`, `powerShellTimeoutMs`,
 `maxPowerShellOutputLength`, `maxFilesystemTransferBytes`,
 `maxInlineFilesystemBytes`, `waitForTimeoutMs`, `notifyAppId`,
-`maxMultiActionSteps`.
+`maxMultiActionSteps`, `maxReadTextLength`, `maxTableCells`.
 
 ## Development
 
@@ -411,6 +471,14 @@ directly against a real target:
 6. Connects with no configured default at all, passing `host`/`user`/
    `password` directly to `resolveSshTarget` — the same path a model-supplied
    per-call `ssh` argument takes.
+7. Pushes a small WinForms test-fixture script (a Button, a CheckBox, a
+   multiline TextBox with known text/selection, and a two-column
+   three-row `ListView`) and launches it via `powershell -File`, then
+   exercises `invoke` (`toggle`/`invoke`/`setValue`), `read_text`
+   (known content + selection), and `read_table` (row/column counts,
+   headers, cell values) against it — plus one negative case per tool
+   (an element that doesn't support the requested pattern) — before
+   killing the fixture process and deleting the pushed script.
 
 It cleans up the Notepad process it launches in `afterAll`.
 

@@ -21,7 +21,8 @@
   or steals keyboard focus unless the caller explicitly set focusFallback.
 
   Operations: windows, apps, shot, tree, snapshot, click, type, scroll, key,
-  move, windowControl, launch, powershell, clipboard, process, displays, notify.
+  move, windowControl, invokePattern, readText, readTable, launch,
+  powershell, clipboard, process, displays, notify.
 #>
 param(
   # Workdir NAME only (not a full path): resolved against $env:TEMP here so
@@ -986,6 +987,214 @@ function Invoke-OpWindowControl($opArgs) {
   return (Get-ActionOutcome $hwnd "window_control:$action" 'posted' $null $null)
 }
 
+function Get-ControlTypeName($element) {
+  try {
+    $name = [string]$element.Current.ControlType.ProgrammaticName
+    if ($name -like 'ControlType.*') { return $name.Substring(12) }
+    return $name
+  } catch {
+    return 'unknown'
+  }
+}
+
+function Invoke-OpInvokePattern($opArgs) {
+  $request = $opArgs.request
+  $focusFallback = if ($null -ne $opArgs.focusFallback) { [bool]$opArgs.focusFallback } else { $false }
+  $hwnd = Resolve-Window @{ windowId = $request.windowId }
+  if ($focusFallback) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
+  $windowElement = Get-UiaElement $hwnd
+  $element = Find-ElementByRuntimeId $windowElement ([string]$request.elementId)
+  if ($null -eq $element) { throw "element '$($request.elementId)' not found in window $hwnd (re-run screen_read)" }
+  $pattern = [string]$request.pattern
+  $controlType = Get-ControlTypeName $element
+  $p = $null
+  switch ($pattern) {
+    'invoke' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'invoke' pattern (control type $controlType)"
+      }
+      $p.Invoke()
+    }
+    'toggle' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'toggle' pattern (control type $controlType)"
+      }
+      $p.Toggle()
+    }
+    'expand' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'expand' pattern (control type $controlType)"
+      }
+      $p.Expand()
+    }
+    'collapse' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'collapse' pattern (control type $controlType)"
+      }
+      $p.Collapse()
+    }
+    'select' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'select' pattern (control type $controlType)"
+      }
+      $p.Select()
+    }
+    'addToSelection' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'addToSelection' pattern (control type $controlType)"
+      }
+      $p.AddToSelection()
+    }
+    'removeFromSelection' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'removeFromSelection' pattern (control type $controlType)"
+      }
+      $p.RemoveFromSelection()
+    }
+    'scrollIntoView' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'scrollIntoView' pattern (control type $controlType)"
+      }
+      $p.ScrollIntoView()
+    }
+    'setValue' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'setValue' pattern (control type $controlType)"
+      }
+      if ($null -eq $request.value) { throw "pattern 'setValue' requires a string value" }
+      $p.SetValue([string]$request.value)
+    }
+    'setRangeValue' {
+      if (-not $element.TryGetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$p)) {
+        throw "element does not support the 'setRangeValue' pattern (control type $controlType)"
+      }
+      if ($null -eq $request.value) { throw "pattern 'setRangeValue' requires a numeric value" }
+      $p.SetValue([double]$request.value)
+    }
+    default { throw "unknown pattern '$pattern'" }
+  }
+  return (Get-ActionOutcome $hwnd "invoke:$pattern" 'uia' $null $null)
+}
+
+function Invoke-OpReadText($opArgs) {
+  $hwnd = Resolve-Window @{ windowId = $opArgs.windowId }
+  $maxLength = if ($null -ne $opArgs.maxLength) { [int]$opArgs.maxLength } else { 20000 }
+  $windowElement = Get-UiaElement $hwnd
+  $element = Find-ElementByRuntimeId $windowElement ([string]$opArgs.elementId)
+  if ($null -eq $element) { throw "element '$($opArgs.elementId)' not found in window $hwnd (re-run screen_read)" }
+  $textPattern = $null
+  # TextPattern itself lives directly under System.Windows.Automation (like
+  # every other pattern class in this file) - only its supporting range type
+  # (TextPatternRange, returned by DocumentRange/GetSelection() below) lives
+  # under the nested System.Windows.Automation.Text namespace.
+  if (-not $element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$textPattern)) {
+    $controlType = Get-ControlTypeName $element
+    throw "element does not support the Text pattern (control type $controlType) - use screen_read for its plain name/value instead"
+  }
+  $fullText = [string]$textPattern.DocumentRange.GetText(-1)
+  $truncated = $false
+  if ($fullText.Length -gt $maxLength) {
+    $fullText = $fullText.Substring(0, $maxLength)
+    $truncated = $true
+  }
+  $selectionText = ''
+  try {
+    $selectionRanges = $textPattern.GetSelection()
+    $parts = @()
+    foreach ($range in $selectionRanges) {
+      $t = [string]$range.GetText(-1)
+      if ($t.Length -gt 0) { $parts += $t }
+    }
+    $selectionText = ($parts -join '')
+  } catch {
+    $selectionText = ''
+  }
+  $result = @{ text = $fullText; truncated = $truncated }
+  if ($selectionText.Length -gt 0) { $result.selectionText = $selectionText }
+  return $result
+}
+
+function Invoke-OpReadTable($opArgs) {
+  $hwnd = Resolve-Window @{ windowId = $opArgs.windowId }
+  $maxCells = if ($null -ne $opArgs.maxCells) { [int]$opArgs.maxCells } else { 500 }
+  $windowElement = Get-UiaElement $hwnd
+  $element = Find-ElementByRuntimeId $windowElement ([string]$opArgs.elementId)
+  if ($null -eq $element) { throw "element '$($opArgs.elementId)' not found in window $hwnd (re-run screen_read)" }
+
+  $gridPattern = $null
+  $hasGrid = $element.TryGetCurrentPattern([System.Windows.Automation.GridPattern]::Pattern, [ref]$gridPattern)
+  $tablePattern = $null
+  $hasTable = $element.TryGetCurrentPattern([System.Windows.Automation.TablePattern]::Pattern, [ref]$tablePattern)
+  if (-not $hasGrid -and -not $hasTable) {
+    $controlType = Get-ControlTypeName $element
+    throw "element supports neither the Grid nor the Table pattern (control type $controlType)"
+  }
+
+  $rowCount = 0
+  $columnCount = 0
+  if ($hasGrid) {
+    $rowCount = [int]$gridPattern.Current.RowCount
+    $columnCount = [int]$gridPattern.Current.ColumnCount
+  } elseif ($hasTable) {
+    $rowCount = [int]$tablePattern.Current.RowCount
+    $columnCount = [int]$tablePattern.Current.ColumnCount
+  }
+
+  # Column headers are a TablePattern-only feature; a plain GridPattern
+  # control (no TablePattern) simply has none to report - that's an omission,
+  # not an error.
+  $columnHeaders = $null
+  if ($hasTable) {
+    try {
+      $headers = $tablePattern.GetColumnHeaders()
+      if ($null -ne $headers -and $headers.Count -gt 0) {
+        $names = @()
+        foreach ($header in $headers) { $names += [string]$header.Current.Name }
+        $columnHeaders = $names
+      }
+    } catch {
+      $columnHeaders = $null
+    }
+  }
+
+  $cells = @()
+  $truncated = $false
+  if ($hasGrid) {
+    $total = $rowCount * $columnCount
+    $limit = [Math]::Min($total, $maxCells)
+    $count = 0
+    for ($r = 0; $r -lt $rowCount -and $count -lt $limit; $r++) {
+      $rowValues = @()
+      for ($c = 0; $c -lt $columnCount -and $count -lt $limit; $c++) {
+        $cellElement = $null
+        try { $cellElement = $gridPattern.GetItem($r, $c) } catch { $cellElement = $null }
+        $text = ''
+        if ($null -ne $cellElement) {
+          try { $text = [string]$cellElement.Current.Name } catch { $text = '' }
+          $valuePattern = $null
+          if ($cellElement.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)) {
+            $valueText = [string]$valuePattern.Current.Value
+            if ($valueText.Length -gt 0) { $text = $valueText }
+          }
+        }
+        $rowValues += $text
+        $count += 1
+      }
+      # Unary comma: appends the row as ONE array element, not each cell
+      # flattened onto $cells - the same array-inside-array pitfall the
+      # unary-comma idiom fixes elsewhere in this file, just one level deeper
+      # (a 1-cell row would otherwise collapse the same way a 1-element
+      # top-level array does).
+      $cells += ,$rowValues
+    }
+    if ($total -gt $maxCells) { $truncated = $true }
+  }
+
+  $result = @{ rowCount = $rowCount; columnCount = $columnCount; truncated = $truncated; cells = $cells }
+  if ($null -ne $columnHeaders) { $result.columnHeaders = $columnHeaders }
+  return $result
+}
+
 function Invoke-OpClipboard($opArgs) {
   $action = [string]$opArgs.action
   if ($action -eq 'get') {
@@ -1195,6 +1404,9 @@ try {
     'key' { $result = Invoke-OpKey $opArgs }
     'move' { $result = Invoke-OpMove $opArgs }
     'windowControl' { $result = Invoke-OpWindowControl $opArgs }
+    'invokePattern' { $result = Invoke-OpInvokePattern $opArgs }
+    'readText' { $result = Invoke-OpReadText $opArgs }
+    'readTable' { $result = Invoke-OpReadTable $opArgs }
     'launch' { $result = Invoke-OpLaunch $opArgs }
     'powershell' { $result = Invoke-OpPowershell $opArgs }
     'clipboard' { $result = Invoke-OpClipboard $opArgs }

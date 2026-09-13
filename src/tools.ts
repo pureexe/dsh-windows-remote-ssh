@@ -3,10 +3,13 @@
  *
  * - Pure observers, never gated: `screen_shot`, `screen_read`, `app_list`,
  *   `display_list`, `wait_for` (polls, but never mutates), `clipboard`
- *   `action: 'get'`, `process` `action: 'list'`.
+ *   `action: 'get'`, `process` `action: 'list'`, `read_text`, `read_table`
+ *   (freshness/identity still checked via {@link ActionExecutor.performRead},
+ *   just never gated by approval).
  * - Window-scoped mutating actions, gated by approval and crossing
  *   {@link ActionExecutor}'s freshness/process-identity checks: `click`,
- *   `type`, `scroll`, `key`, `move`, `multi_action`, `window_control`.
+ *   `type`, `scroll`, `key`, `move`, `multi_action`, `window_control`,
+ *   `invoke` (direct UIA pattern-method calls in place of a posted click).
  * - No-window mutating actions, gated by approval against a descriptive
  *   subject instead of a cited observation: `app_launch`, `filesystem_pull`,
  *   `filesystem_push`, `clipboard` `action: 'set'`, `process` `action:
@@ -31,13 +34,13 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ActionExecutor } from './actions.ts'
-import { MAX_WAIT_FOR_TIMEOUT_MS, MIN_WAIT_FOR_TIMEOUT_MS, resolveSshTarget, type ResolvedConfig, type ResolvedSshConfig, type SshConfig } from './config.ts'
+import { MAX_SCREENSHOT_SIDE, MAX_WAIT_FOR_TIMEOUT_MS, MIN_SCREENSHOT_SIDE, MIN_WAIT_FOR_TIMEOUT_MS, resolveSshTarget, type ResolvedConfig, type ResolvedSshConfig, type SshConfig } from './config.ts'
 import { appendAuditEvent, OBSERVED_EVENT, type ObservedEvent } from './events.ts'
 import { detectImageMediaType, looksLikeText } from './filesystem.ts'
 import { ObservationStore } from './observe.ts'
 import { redactSensitive, sanitizePath, sanitizeVisible } from './sanitize.ts'
 import { elementMatches, windowMatches } from './wait.ts'
-import type { DesktopBackend, ElementInfo, PixelHint, Rect, WindowInfo, WindowRef, WindowSnapshot } from './platform/types.ts'
+import type { DesktopBackend, ElementInfo, PixelHint, Rect, UiaPattern, WindowInfo, WindowRef, WindowSnapshot } from './platform/types.ts'
 
 /** Resolve after `ms`, or immediately once `signal` aborts — the `wait_for` poll cadence. */
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -173,6 +176,21 @@ function shotDescription(window: ObservedWindowValue, width: number, height: num
 }
 
 /**
+ * Resolve `screen_shot`'s `maxSide`: `configuredDefault` (`config.maxScreenshotSide`)
+ * applies only when the call omits `maxSide` - it is a default, not a
+ * ceiling, so an explicit request is honored even above it, bounded only by
+ * the absolute `MIN_SCREENSHOT_SIDE`/`MAX_SCREENSHOT_SIDE` range (the model
+ * may deliberately ask for a higher resolution, e.g. to read small text).
+ */
+export function resolveScreenshotMaxSide(requested: number | undefined, configuredDefault: number): number {
+  if (requested === undefined) return configuredDefault
+  if (!Number.isInteger(requested) || requested < MIN_SCREENSHOT_SIDE || requested > MAX_SCREENSHOT_SIDE) {
+    throw new Error(`maxSide must be an integer between ${MIN_SCREENSHOT_SIDE} and ${MAX_SCREENSHOT_SIDE}`)
+  }
+  return requested
+}
+
+/**
  * `screen_shot` — capture the addressed window, or the current foreground
  * window when none is given (matching `screen_read`'s own no-target
  * behavior — the two must agree, or a later action's windowId can mismatch
@@ -213,7 +231,10 @@ export function screenShotTool(services: ToolServices) {
         },
         additionalProperties: false,
       },
-      maxSide: { type: 'integer', description: 'Longest side in pixels; larger captures are downscaled.' },
+      maxSide: {
+        type: 'integer',
+        description: `Longest side in pixels (${MIN_SCREENSHOT_SIDE}-${MAX_SCREENSHOT_SIDE}); larger captures are downscaled. Defaults to the configured maxScreenshotSide, but an explicit value here is honored even above that default (up to the absolute ceiling) - ask for more when you genuinely need higher resolution, e.g. to read small text.`,
+      },
     },
     output: {
       schema: {
@@ -290,8 +311,7 @@ export function screenShotTool(services: ToolServices) {
       const wholeScreen = parsed.wholeScreen === true
       const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
       const backend = getBackend(sshTarget)
-      const requestedSide = parsed.maxSide
-      const maxSide = requestedSide === undefined ? config.maxScreenshotSide : Math.min(requestedSide, config.maxScreenshotSide)
+      const maxSide = resolveScreenshotMaxSide(parsed.maxSide, config.maxScreenshotSide)
       const shot = await backend.shot(target, maxSide, wholeScreen, {
         ...parsed.region !== undefined ? { region: parsed.region } : {},
         ...parsed.display !== undefined ? { display: parsed.display } : {},
@@ -2016,6 +2036,216 @@ export function windowControlTool(services: ToolServices) {
   })
 }
 
+/** UIA pattern names `invoke` accepts, in the order documented in its description. */
+const UIA_PATTERNS = [
+  'invoke', 'toggle', 'expand', 'collapse',
+  'select', 'addToSelection', 'removeFromSelection',
+  'scrollIntoView', 'setValue', 'setRangeValue',
+] as const
+
+/**
+ * `invoke` — call a UI Automation control pattern method directly on an
+ * addressed element (`InvokePattern.Invoke`, `TogglePattern.Toggle`,
+ * `ExpandCollapsePattern.Expand`/`Collapse`,
+ * `SelectionItemPattern.Select`/`AddToSelection`/`RemoveFromSelection`,
+ * `ScrollItemPattern.ScrollIntoView`, `ValuePattern.SetValue`,
+ * `RangeValuePattern.SetValue`) instead of posting a synthetic click or
+ * keystroke — more reliable for controls that react to their real pattern
+ * method but ignore posted input. Always addressed by `elementId` (never
+ * coordinates): the helper re-resolves that exact element by its UIA
+ * RuntimeId immediately before acting and fails loudly if it's gone, or if
+ * it doesn't support the requested pattern, so the whole-window tree hash
+ * adds no safety here (same reasoning as elementId-addressed `click`/`type`).
+ */
+export function invokeTool(services: ToolServices) {
+  const { config, actions } = services
+  return defineTool({
+    name: 'invoke',
+    description:
+      'Call a UI Automation control pattern method directly on an element of an observed window on the remote Windows host, instead of posting a synthetic click or keystroke. pattern: "invoke" (InvokePattern.Invoke), "toggle" (TogglePattern.Toggle), "expand"/"collapse" (ExpandCollapsePattern.Expand/Collapse), "select"/"addToSelection"/"removeFromSelection" (SelectionItemPattern), "scrollIntoView" (ScrollItemPattern.ScrollIntoView), "setValue" (ValuePattern.SetValue — requires a string `value`), "setRangeValue" (RangeValuePattern.SetValue — requires a numeric `value`). Fails with a clear error naming the pattern and the element\'s control type if the element does not support the requested pattern — never silently no-ops. Requires `basedOn`; fails if the remote screen changed since that observation. Requires approval unless the window is allowlisted.',
+    parameters: {
+      ...basedOnParameters,
+      elementId: { type: 'string', description: 'Element id from screen_read.', required: true as const },
+      pattern: { type: 'string', enum: UIA_PATTERNS, description: 'Which UIA pattern method to call.', required: true as const },
+      value: {
+        oneOf: [
+          { type: 'string' as const, description: 'For pattern "setValue": the exact text to set via ValuePattern.SetValue().' },
+          { type: 'number' as const, description: 'For pattern "setRangeValue": the numeric value to set via RangeValuePattern.SetValue().' },
+        ] as const,
+        description: 'Required for pattern "setValue" (string) or "setRangeValue" (number); ignored for every other pattern.',
+      },
+    },
+    output: {
+      schema: actionOutputSchema(false),
+      render(_args, value): ContentBlock[] {
+        return [{ type: 'text', text: actionLine('invoke', value as unknown as Parameters<typeof actionLine>[1]) }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as {
+        basedOn: { observationId: string; windowId: number }
+        elementId: string
+        pattern: typeof UIA_PATTERNS[number]
+        value?: string | number
+      }
+      if (!(UIA_PATTERNS as readonly string[]).includes(parsed.pattern)) {
+        throw new Error(`invoke pattern must be one of: ${UIA_PATTERNS.join(', ')}`)
+      }
+      if (parsed.pattern === 'setValue' && typeof parsed.value !== 'string') {
+        throw new Error('invoke pattern "setValue" requires a string value')
+      }
+      if (parsed.pattern === 'setRangeValue' && typeof parsed.value !== 'number') {
+        throw new Error('invoke pattern "setRangeValue" requires a numeric value')
+      }
+      const outcome = await actions.perform('invoke', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, (focusFallback, backend) =>
+        backend.invokePattern({
+          windowId: parsed.basedOn.windowId,
+          elementId: parsed.elementId,
+          pattern: parsed.pattern as UiaPattern,
+          ...parsed.value !== undefined ? { value: parsed.value } : {},
+        }, focusFallback, exec.signal),
+        // Always elementId-addressed: the helper re-resolves it by UIA
+        // RuntimeId right before calling the pattern method, exactly like
+        // elementId-addressed click/type, so the whole-window tree hash adds
+        // no safety here.
+        false)
+      return {
+        ok: true,
+        windowId: outcome.windowId,
+        delivered: outcome.delivered,
+        process: { before: outcome.processBefore, after: outcome.processAfter },
+        ...outcome.detail !== undefined ? { detail: outcome.detail } : {},
+      }
+    },
+  })
+}
+
+/**
+ * `read_text` — read one text/document element's full content and current
+ * selection via the UIA Text pattern (`TextPattern.DocumentRange.GetText(-1)`
+ * / `GetSelection()`), richer than the plain `Name`/`Value` already exposed
+ * by `screen_read`. Pure observer: never gated by approval, but still
+ * resolves its target through the cited `basedOn` observation and confirms
+ * the window's identity hasn't changed underneath it (via
+ * {@link ActionExecutor.performRead}).
+ */
+export function readTextTool(services: ToolServices) {
+  const { config, actions } = services
+  return defineTool({
+    name: 'read_text',
+    description:
+      'Read one text/document/edit element\'s full content and current text selection (if any) via the UI Automation Text pattern, on an observed window on the remote Windows host. Richer than the plain name/value screen_read already returns: the Text pattern exposes a document\'s full content (and current selection) even when it is far longer than what a plain Name/Value property would carry. Fails with a clear error naming the element\'s control type if it does not support the Text pattern. Requires `basedOn`; fails if the remote screen changed since that observation. Read-only: never needs approval.',
+    parameters: {
+      ...basedOnParameters,
+      elementId: { type: 'string', description: 'Text/document/edit element id from screen_read.', required: true as const },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          text: { type: 'string' },
+          truncated: { type: 'boolean' },
+          selectionText: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as { text: string; truncated: boolean; selectionText?: string }
+        const lines = [
+          `Text pattern content (${result.text.length} chars${result.truncated ? ', truncated' : ''}):`,
+          result.text,
+        ]
+        if (result.selectionText !== undefined) {
+          lines.push(`Current selection (${result.selectionText.length} chars):`, result.selectionText)
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as { basedOn: { observationId: string; windowId: number }; elementId: string }
+      const result = await actions.performRead('read_text', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, backend =>
+        backend.readText(parsed.basedOn.windowId, parsed.elementId, exec.signal))
+      return {
+        ok: true,
+        text: result.text,
+        truncated: result.truncated,
+        ...result.selectionText !== undefined ? { selectionText: result.selectionText } : {},
+      }
+    },
+  })
+}
+
+/**
+ * `read_table` — read one grid/table element's structured cell data via the
+ * Grid/GridItem/Table/TableItem patterns, on an observed window on the
+ * remote Windows host. Pure observer: never gated by approval, but still
+ * resolves its target through the cited `basedOn` observation and confirms
+ * the window's identity hasn't changed underneath it (via
+ * {@link ActionExecutor.performRead}).
+ */
+export function readTableTool(services: ToolServices) {
+  const { config, actions } = services
+  return defineTool({
+    name: 'read_table',
+    description:
+      'Read one grid/list/table element\'s structured cell data (row count, column count, cell text, and column headers when available) via the UI Automation Grid/GridItem/Table/TableItem patterns, on an observed window on the remote Windows host. Each cell prefers its ValuePattern value, falling back to its Name. Column headers are included only when the element supports TablePattern (omitted, not an error, when it supports only GridPattern). Cells are capped at the configured maxTableCells (a total-cell cap, not per-dimension); rowCount/columnCount are always reported truthfully even when cells was capped short of them, and `truncated: true` marks that. Fails with a clear error naming the element\'s control type if it supports neither pattern. Requires `basedOn`; fails if the remote screen changed since that observation. Read-only: never needs approval.',
+    parameters: {
+      ...basedOnParameters,
+      elementId: { type: 'string', description: 'Grid/list/table element id from screen_read.', required: true as const },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', const: true },
+          rowCount: { type: 'integer' },
+          columnCount: { type: 'integer' },
+          truncated: { type: 'boolean' },
+          columnHeaders: { type: 'array', items: { type: 'string' } },
+          cells: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
+        },
+        additionalProperties: false,
+      },
+      render(_args, value): ContentBlock[] {
+        const result = value as unknown as {
+          rowCount: number
+          columnCount: number
+          truncated: boolean
+          columnHeaders?: string[]
+          cells: string[][]
+        }
+        const lines = [
+          `Table: ${result.rowCount} row(s) x ${result.columnCount} column(s)${result.truncated ? ' (cells truncated at the configured cap)' : ''}.`,
+        ]
+        if (result.columnHeaders !== undefined) {
+          lines.push(`Headers: ${result.columnHeaders.join(' | ')}`)
+        }
+        for (const row of result.cells) {
+          lines.push(row.join(' | '))
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
+    async execute(args, exec) {
+      const parsed = args as { basedOn: { observationId: string; windowId: number }; elementId: string }
+      const result = await actions.performRead('read_table', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, backend =>
+        backend.readTable(parsed.basedOn.windowId, parsed.elementId, exec.signal))
+      return {
+        ok: true,
+        rowCount: result.rowCount,
+        columnCount: result.columnCount,
+        truncated: result.truncated,
+        ...result.columnHeaders !== undefined ? { columnHeaders: result.columnHeaders } : {},
+        cells: result.cells,
+      }
+    },
+  })
+}
+
 /** Every tool definition, in registration order. */
 export function allTools(services: ToolServices) {
   return [
@@ -2029,6 +2259,9 @@ export function allTools(services: ToolServices) {
     waitForTool(services),
     multiActionTool(services),
     windowControlTool(services),
+    invokeTool(services),
+    readTextTool(services),
+    readTableTool(services),
     appListTool(services),
     appLaunchTool(services),
     filesystemPullTool(services),

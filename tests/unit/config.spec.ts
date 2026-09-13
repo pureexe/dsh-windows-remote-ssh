@@ -203,6 +203,32 @@ describe('resolveConfig', () => {
     expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxMultiActionSteps: 0 })).toThrow(/maxMultiActionSteps/u)
     expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxMultiActionSteps: 101 })).toThrow(/maxMultiActionSteps/u)
   })
+
+  it('applies defaults for maxReadTextLength and maxTableCells', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' } })
+    expect(resolved.maxReadTextLength).toBe(20_000)
+    expect(resolved.maxTableCells).toBe(500)
+  })
+
+  it('accepts custom maxReadTextLength and maxTableCells within bounds', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxReadTextLength: 200_000, maxTableCells: 5_000 })
+    expect(resolved.maxReadTextLength).toBe(200_000)
+    expect(resolved.maxTableCells).toBe(5_000)
+  })
+
+  it('rejects an out-of-range maxReadTextLength', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxReadTextLength: 0 })).toThrow(/maxReadTextLength/u)
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxReadTextLength: 200_001 })).toThrow(/maxReadTextLength/u)
+  })
+
+  it('rejects an out-of-range maxTableCells', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxTableCells: 0 })).toThrow(/maxTableCells/u)
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, maxTableCells: 5_001 })).toThrow(/maxTableCells/u)
+  })
 })
 
 describe('resolveSshTarget', () => {

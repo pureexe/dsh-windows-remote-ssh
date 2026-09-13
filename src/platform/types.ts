@@ -166,6 +166,66 @@ export interface MoveRequest {
   }
 }
 
+/**
+ * UIA control patterns `invoke` may call directly on the addressed element,
+ * instead of posting a synthetic click/keystroke: `'invoke'`
+ * (`InvokePattern.Invoke`), `'toggle'` (`TogglePattern.Toggle`),
+ * `'expand'`/`'collapse'` (`ExpandCollapsePattern`),
+ * `'select'`/`'addToSelection'`/`'removeFromSelection'`
+ * (`SelectionItemPattern`), `'scrollIntoView'` (`ScrollItemPattern`),
+ * `'setValue'` (`ValuePattern.SetValue`, string), `'setRangeValue'`
+ * (`RangeValuePattern.SetValue`, number).
+ */
+export type UiaPattern =
+  | 'invoke'
+  | 'toggle'
+  | 'expand'
+  | 'collapse'
+  | 'select'
+  | 'addToSelection'
+  | 'removeFromSelection'
+  | 'scrollIntoView'
+  | 'setValue'
+  | 'setRangeValue'
+
+/** An `invoke` request: call one UIA control pattern method directly on the addressed element. */
+export interface InvokePatternRequest {
+  windowId: number
+  elementId: string
+  pattern: UiaPattern
+  /** Required for `'setValue'` (a string) and `'setRangeValue'` (a number); ignored for every other pattern. */
+  value?: string | number
+}
+
+/**
+ * `read_text`'s result: one text/document element's full content via the UIA
+ * Text pattern (`TextPattern.DocumentRange.GetText(-1)`), plus its current
+ * selection's text, if any (`TextPattern.GetSelection()`).
+ */
+export interface TextReadResult {
+  text: string
+  /** True when `text` was cut short at the configured `maxReadTextLength`. */
+  truncated: boolean
+  selectionText?: string
+}
+
+/**
+ * `read_table`'s result: structured grid/table cell data via the
+ * Grid/GridItem/Table/TableItem patterns.
+ */
+export interface TableReadResult {
+  /** The grid/table's true row count, even when `cells` was capped short of it. */
+  rowCount: number
+  /** The grid/table's true column count, even when `cells` was capped short of it. */
+  columnCount: number
+  /** True when `cells` was cut short at the configured `maxTableCells` (a total-cell cap, not per-dimension). */
+  truncated: boolean
+  /** Column header names via `TablePattern.GetColumnHeaders()`; omitted when the element supports only `GridPattern`, not `TablePattern`. */
+  columnHeaders?: string[]
+  /** Row-major cell text: each cell's `ValuePattern.Value` when supported, else its `Name`. */
+  cells: string[][]
+}
+
 /** A window state-change request. `x`/`y` apply to `move`; `width`/`height` apply to `resize`. */
 export interface WindowControlRequest {
   windowId: number
@@ -283,6 +343,24 @@ export interface DesktopBackend {
   move(request: MoveRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
   /** Change a window's state: minimize/maximize/restore/move/resize/close. */
   windowControl(request: WindowControlRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
+  /**
+   * Call one UIA control pattern method directly on the addressed element
+   * (see {@link UiaPattern}) instead of posting a synthetic click/keystroke —
+   * more reliable for controls that react to their real pattern method but
+   * ignore posted input. Mutating: gated by approval like `click`/`type`.
+   */
+  invokePattern(request: InvokePatternRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
+  /**
+   * Read one text/document element's full content and current selection via
+   * the UIA Text pattern — richer than the plain `Name`/`Value` already
+   * exposed by `screen_read`. Pure observer: never gated.
+   */
+  readText(windowId: number, elementId: string, signal?: AbortSignal): Promise<TextReadResult>
+  /**
+   * Read one grid/table element's structured cell data via the
+   * Grid/GridItem/Table/TableItem patterns. Pure observer: never gated.
+   */
+  readTable(windowId: number, elementId: string, signal?: AbortSignal): Promise<TableReadResult>
   apps(signal?: AbortSignal): Promise<AppInfo[]>
   launch(name: string, args: readonly string[], signal?: AbortSignal): Promise<LaunchOutcome>
   /**

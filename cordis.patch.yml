@@ -141,3 +141,14 @@
         # (1..100). A single tool call staying bounded, not a substitute for
         # a real scripting loop.
         maxMultiActionSteps: 20
+        # Cap on the text read_text returns from one element's Text pattern
+        # document (1..200000). A document's full text can be much longer
+        # than maxTextLength, which is for short sanitized labels like
+        # titles, not document bodies.
+        maxReadTextLength: 20000
+        # Cap on the total number of cells (rows x columns actually read)
+        # one read_table call returns (1..5000) - a total-cell cap, not a
+        # per-dimension one. A grid bigger than this still reports its true
+        # rowCount/columnCount but only populates cells up to the cap and
+        # reports truncated: true.
+        maxTableCells: 500

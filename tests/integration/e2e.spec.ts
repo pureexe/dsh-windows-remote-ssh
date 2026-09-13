@@ -452,4 +452,159 @@ describe.skipIf(!hasTarget)('remote Windows host over SSH (live integration)', (
       expect(typeOutcome.processBefore.pid).toBe(typeOutcome.processAfter.pid)
     })
   })
+
+  describe('invoke / read_text / read_table (UIA pattern tools, against real native apps)', () => {
+    // A from-scratch WinForms fixture was tried first and abandoned: ad-hoc
+    // PowerShell-hosted WinForms controls report as generic UIA "Pane"
+    // elements with no discoverable patterns on this target (confirmed via
+    // direct AutomationElement queries, independent of this plugin's own
+    // helper code) - a real WinForms/UIA-bridge limitation in this
+    // environment, not a bug in invoke/read_text/read_table. Real apps are
+    // used instead: modern Notepad's own toolbar/menu/document expose
+    // invoke/toggle/expand-collapse/value patterns natively, and Explorer's
+    // file-listing view exposes Grid/Table patterns natively.
+    let invokePid: number | undefined
+    let invokeWindowId: number | undefined
+    let explorerPid: number | undefined
+    let explorerWindowId: number | undefined
+
+    afterAll(async () => {
+      if (invokePid !== undefined) await cleanup.exec(`taskkill /F /PID ${invokePid}`).catch(() => undefined)
+      if (explorerPid !== undefined) await cleanup.exec(`taskkill /F /PID ${explorerPid}`).catch(() => undefined)
+    })
+
+    it('launches a fresh Notepad window for the invoke/read_text tests', async () => {
+      const launch = await backend.launch('notepad', [])
+      invokePid = launch.processId
+      let windowId: number | undefined
+      for (let attempt = 0; attempt < 20 && windowId === undefined; attempt += 1) {
+        const apps = await backend.apps()
+        const app = apps.find(candidate => candidate.processId === launch.processId)
+        if (app !== undefined && app.windows.length > 0) windowId = app.windows[0]!.windowId
+        else await new Promise(resolve => setTimeout(resolve, 300))
+      }
+      expect(windowId).toBeDefined()
+      invokeWindowId = windowId
+    }, 30_000)
+
+    it('read_text: reads the Document element\'s content via TextPattern after typing known text', async () => {
+      expect(invokeWindowId).toBeDefined()
+      const tree = await backend.tree({ windowId: invokeWindowId! }, 200, 20, false)
+      const editable = tree.elements.find(element => element.controlType === 'Document')
+      expect(editable).toBeDefined()
+      const marker = `dsh-read-text-marker-${Date.now()}`
+      await backend.type({ windowId: invokeWindowId!, elementId: editable!.elementId, text: marker, rollback: false }, false)
+      const result = await backend.readText(invokeWindowId!, editable!.elementId)
+      expect(result.text).toContain(marker)
+      expect(result.truncated).toBe(false)
+    })
+
+    it('read_text: fails clearly (naming the control type) against an element with no Text pattern', async () => {
+      const tree = await backend.tree({ windowId: invokeWindowId! }, 200, 20, false)
+      const toggleButton = tree.elements.find(element => element.patterns.includes('toggle'))
+      expect(toggleButton).toBeDefined()
+      await expect(backend.readText(invokeWindowId!, toggleButton!.elementId)).rejects.toThrow(/text pattern/iu)
+    })
+
+    it('invoke: "toggle" flips a real formatting button via TogglePattern (delivered: uia)', async () => {
+      const tree = await backend.tree({ windowId: invokeWindowId! }, 200, 20, false)
+      const toggleButton = tree.elements.find(element => element.patterns.includes('toggle'))
+      expect(toggleButton).toBeDefined()
+      const outcome = await backend.invokePattern({
+        windowId: invokeWindowId!,
+        elementId: toggleButton!.elementId,
+        pattern: 'toggle',
+      }, false)
+      expect(outcome.delivered).toBe('uia')
+      expect(outcome.processBefore.pid).toBe(outcome.processAfter.pid)
+    })
+
+    it('invoke: "invoke" calls InvokePattern.Invoke on a real button (delivered: uia)', async () => {
+      const tree = await backend.tree({ windowId: invokeWindowId! }, 200, 20, false)
+      // Any invoke-only button works; "invoke"-pattern buttons that also carry
+      // expand-collapse (menu items) are avoided here to keep this test's
+      // side effect contained to "a new tab/pane opens", not "a menu flyout".
+      const invokeButton = tree.elements.find(element => element.patterns.includes('invoke') && !element.patterns.includes('expand-collapse'))
+      expect(invokeButton).toBeDefined()
+      const outcome = await backend.invokePattern({
+        windowId: invokeWindowId!,
+        elementId: invokeButton!.elementId,
+        pattern: 'invoke',
+      }, false)
+      expect(outcome.delivered).toBe('uia')
+    })
+
+    it('invoke: "expand" then "collapse" a real menu item via ExpandCollapsePattern (delivered: uia)', async () => {
+      const tree = await backend.tree({ windowId: invokeWindowId! }, 200, 20, false)
+      const menuItem = tree.elements.find(element => element.controlType === 'MenuItem' && element.patterns.includes('expand-collapse'))
+      expect(menuItem).toBeDefined()
+      const expandOutcome = await backend.invokePattern({ windowId: invokeWindowId!, elementId: menuItem!.elementId, pattern: 'expand' }, false)
+      expect(expandOutcome.delivered).toBe('uia')
+      const collapseOutcome = await backend.invokePattern({ windowId: invokeWindowId!, elementId: menuItem!.elementId, pattern: 'collapse' }, false)
+      expect(collapseOutcome.delivered).toBe('uia')
+    })
+
+    it('invoke: "setValue" sets the Document element\'s value via ValuePattern.SetValue', async () => {
+      const tree = await backend.tree({ windowId: invokeWindowId! }, 200, 20, false)
+      const editable = tree.elements.find(element => element.controlType === 'Document')
+      expect(editable).toBeDefined()
+      const marker = `dsh-invoke-setValue-marker-${Date.now()}`
+      const outcome = await backend.invokePattern({
+        windowId: invokeWindowId!,
+        elementId: editable!.elementId,
+        pattern: 'setValue',
+        value: marker,
+      }, false)
+      expect(outcome.delivered).toBe('uia')
+      const after = await backend.readText(invokeWindowId!, editable!.elementId)
+      expect(after.text).toBe(marker)
+    })
+
+    it('invoke: fails clearly (naming the pattern and control type) when the element does not support the requested pattern', async () => {
+      const tree = await backend.tree({ windowId: invokeWindowId! }, 200, 20, false)
+      const invokeOnlyButton = tree.elements.find(element => element.patterns.includes('invoke') && !element.patterns.includes('toggle'))
+      expect(invokeOnlyButton).toBeDefined()
+      await expect(backend.invokePattern({
+        windowId: invokeWindowId!,
+        elementId: invokeOnlyButton!.elementId,
+        pattern: 'toggle',
+      }, false)).rejects.toThrow(/toggle/iu)
+    })
+
+    it('read_table: returns Explorer\'s file-listing row/column counts, headers, and cell values', async () => {
+      const launch = await backend.launch('explorer', ['C:\\Windows\\System32\\drivers\\etc'])
+      explorerPid = launch.processId
+      // Explorer often reuses an existing host process/window rather than
+      // creating one owned by launch()'s own reported pid, so poll the whole
+      // window list for the folder's title instead of matching by processId.
+      let windowId: number | undefined
+      for (let attempt = 0; attempt < 30 && windowId === undefined; attempt += 1) {
+        const windows = await backend.listWindows()
+        const window = windows.find(candidate => candidate.title.toLowerCase().includes('etc') && candidate.className.toLowerCase().includes('cabinetwclass'))
+        if (window !== undefined) windowId = window.windowId
+        else await new Promise(resolve => setTimeout(resolve, 500))
+      }
+      expect(windowId).toBeDefined()
+      explorerWindowId = windowId
+
+      const tree = await backend.tree({ windowId: windowId! }, 200, 20, false)
+      const itemsView = tree.elements.find(element => element.name === 'Items View')
+      expect(itemsView).toBeDefined()
+      const result = await backend.readTable(windowId!, itemsView!.elementId)
+      expect(result.rowCount).toBeGreaterThan(0)
+      expect(result.columnCount).toBeGreaterThan(0)
+      expect(result.cells.length).toBe(result.rowCount)
+      for (const row of result.cells) expect(row.length).toBe(result.columnCount)
+      // %windir%\System32\drivers\etc\hosts ships on every stock Windows install.
+      expect(result.cells.some(row => row.some(cell => cell.toLowerCase().includes('hosts')))).toBe(true)
+    })
+
+    it('read_table: fails clearly (naming the control type) against an element with neither Grid nor Table pattern', async () => {
+      expect(explorerWindowId).toBeDefined()
+      const tree = await backend.tree({ windowId: explorerWindowId! }, 200, 20, false)
+      const nonGridElement = tree.elements.find(element => element.controlType === 'Edit' || element.controlType === 'ToolBar')
+      expect(nonGridElement).toBeDefined()
+      await expect(backend.readTable(explorerWindowId!, nonGridElement!.elementId)).rejects.toThrow(/grid.*table|neither/iu)
+    })
+  })
 })

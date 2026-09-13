@@ -225,6 +225,65 @@ export class ActionExecutor {
   }
 
   /**
+   * Run one read-only, window-scoped action (`read_text`/`read_table`) that
+   * still needs a fresh, identity-verified target but must NEVER go through
+   * the approval gate — the same policy tier as `screen_read`/`app_list`:
+   * pure observers, no approval, ever. Freshness still matters for
+   * correctness (reading the right window, not a stale/renamed one), so this
+   * still calls {@link requireFreshWindow} and audits the outcome — it just
+   * never calls {@link gate} and always audits `approved: 'none'` (the same
+   * value `perform`/`performMulti` record when `requireApproval` happens to
+   * be off, reused here because there is structurally no approval decision
+   * to record at all).
+   *
+   * Unlike {@link perform}, `run` returns a plain read result (not an
+   * `ActionOutcome`), so there is no process-identity before/after to verify
+   * — a single read has no "during the action" window for the process to
+   * have changed under.
+   *
+   * @param checkTree - forwarded to the freshness check; default `false`
+   * since `read_text`/`read_table` always address one specific `elementId`
+   * that the helper re-resolves by UIA RuntimeId immediately before reading,
+   * exactly like elementId-addressed `click`/`type`.
+   */
+  async performRead<T>(
+    toolName: string,
+    exec: ToolRunContext,
+    observationId: string,
+    windowId: number,
+    run: (backend: DesktopBackend) => Promise<T>,
+    checkTree = false,
+  ): Promise<T> {
+    let observationIdAudited: string | undefined
+    let windowIdAudited: number | undefined
+    try {
+      const { record } = await this.requireFreshWindow(observationId, windowId, exec.signal, checkTree)
+      observationIdAudited = observationId
+      windowIdAudited = windowId
+      const result = await run(this.deps.getBackend(record.target))
+      this.audit(exec, {
+        tool: toolName,
+        approved: 'none',
+        outcome: 'ok',
+        observationId: observationIdAudited,
+        windowId: windowIdAudited,
+      })
+      return result
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.audit(exec, {
+        tool: toolName,
+        approved: 'none',
+        outcome: 'error',
+        ...observationIdAudited !== undefined ? { observationId: observationIdAudited } : {},
+        ...windowIdAudited !== undefined ? { windowId: windowIdAudited } : {},
+        detail: message,
+      })
+      throw error
+    }
+  }
+
+  /**
    * Run a batch of window-scoped mutating sub-actions (`multi_action`)
    * against ONE cited observation, sequentially, in a single approval ask —
    * not one ask per step. Freshness is checked once up front, exactly like

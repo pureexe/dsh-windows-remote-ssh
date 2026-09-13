@@ -86,6 +86,22 @@ export const DEFAULT_MAX_MULTI_ACTION_STEPS = 20
 /** Ceiling on `maxMultiActionSteps` — a single tool call staying bounded, not a substitute for a real scripting loop. */
 export const MAX_MULTI_ACTION_STEPS = 100
 
+/**
+ * Default cap on the text `read_text` returns from one element's Text
+ * pattern document (20000 chars) — mirrors `maxPowerShellOutputLength`'s
+ * shape rather than the much shorter `maxTextLength`, which is for short
+ * sanitized labels (titles, names) and would truncate a real document body
+ * almost immediately.
+ */
+export const DEFAULT_MAX_READ_TEXT_LENGTH = 20_000
+/** Ceiling on `maxReadTextLength`. */
+export const MAX_READ_TEXT_LENGTH = 200_000
+
+/** Default cap on the total number of cells (rows × columns actually read) one `read_table` call returns. */
+export const DEFAULT_MAX_TABLE_CELLS = 500
+/** Ceiling on `maxTableCells`. */
+export const MAX_TABLE_CELLS = 5_000
+
 /** SSH connection parameters for the remote Windows host. */
 export interface SshConfig {
   /** Hostname or IP; falls back to env `SSH_HOST`. */
@@ -212,6 +228,20 @@ export interface Config {
    * substitute for a real scripting loop.
    */
   maxMultiActionSteps?: number
+  /**
+   * Cap on the text `read_text` returns from one element's Text pattern
+   * document (default 20000, max 200000) — a document's full text can be
+   * much longer than `maxTextLength`, which is for short sanitized labels
+   * like titles, not document bodies.
+   */
+  maxReadTextLength?: number
+  /**
+   * Cap on the total number of cells (rows × columns actually read) one
+   * `read_table` call returns (default 500, max 5000) — not a per-dimension
+   * cap; a grid bigger than this still reports its true rowCount/columnCount
+   * but only populates cells up to the cap and reports `truncated: true`.
+   */
+  maxTableCells?: number
 }
 
 /** Fully resolved configuration captured at plugin load. */
@@ -246,6 +276,8 @@ export interface ResolvedConfig {
   waitForTimeoutMs: number
   notifyAppId: string
   maxMultiActionSteps: number
+  maxReadTextLength: number
+  maxTableCells: number
 }
 
 /** Schemastery schema for loader-validated configuration. */
@@ -284,6 +316,8 @@ export const Config: z<Config> = z.object({
   waitForTimeoutMs: z.number().min(MIN_WAIT_FOR_TIMEOUT_MS).max(MAX_WAIT_FOR_TIMEOUT_MS).default(DEFAULT_WAIT_FOR_TIMEOUT_MS),
   notifyAppId: z.string().default(DEFAULT_NOTIFY_APP_ID),
   maxMultiActionSteps: z.number().min(1).max(MAX_MULTI_ACTION_STEPS).default(DEFAULT_MAX_MULTI_ACTION_STEPS),
+  maxReadTextLength: z.number().min(1).max(MAX_READ_TEXT_LENGTH).default(DEFAULT_MAX_READ_TEXT_LENGTH),
+  maxTableCells: z.number().min(1).max(MAX_TABLE_CELLS).default(DEFAULT_MAX_TABLE_CELLS),
 })
 
 /** Throw the standard fail-loud config error for one invalid field. */
@@ -588,6 +622,16 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
     invalid('maxMultiActionSteps', `must be an integer between 1 and ${MAX_MULTI_ACTION_STEPS}`)
   }
 
+  const maxReadTextLength = config?.maxReadTextLength ?? DEFAULT_MAX_READ_TEXT_LENGTH
+  if (!Number.isInteger(maxReadTextLength) || maxReadTextLength < 1 || maxReadTextLength > MAX_READ_TEXT_LENGTH) {
+    invalid('maxReadTextLength', `must be an integer between 1 and ${MAX_READ_TEXT_LENGTH}`)
+  }
+
+  const maxTableCells = config?.maxTableCells ?? DEFAULT_MAX_TABLE_CELLS
+  if (!Number.isInteger(maxTableCells) || maxTableCells < 1 || maxTableCells > MAX_TABLE_CELLS) {
+    invalid('maxTableCells', `must be an integer between 1 and ${MAX_TABLE_CELLS}`)
+  }
+
   return Object.freeze({
     ssh,
     requireApproval,
@@ -614,5 +658,7 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
     waitForTimeoutMs,
     notifyAppId,
     maxMultiActionSteps,
+    maxReadTextLength,
+    maxTableCells,
   })
 }
