@@ -273,6 +273,15 @@ export function screenShotTool(services: ToolServices) {
               width: { type: 'integer' },
               height: { type: 'integer' },
               name: { type: 'string' },
+              originalDimensions: {
+                type: 'object',
+                description: 'Present only when the attachment store downscaled this image on save: its input dimensions before that normalization.',
+                properties: {
+                  width: { type: 'integer' },
+                  height: { type: 'integer' },
+                },
+                additionalProperties: false,
+              },
             },
             additionalProperties: false,
           },
@@ -1037,6 +1046,15 @@ export function filesystemPullTool(services: ToolServices) {
               width: { type: 'integer' },
               height: { type: 'integer' },
               name: { type: 'string' },
+              originalDimensions: {
+                type: 'object',
+                description: 'Present only when the attachment store downscaled this image on save: its input dimensions before that normalization.',
+                properties: {
+                  width: { type: 'integer' },
+                  height: { type: 'integer' },
+                },
+                additionalProperties: false,
+              },
             },
             additionalProperties: false,
           },
@@ -1145,6 +1163,15 @@ export function filesystemPushTool(services: ToolServices) {
           width: { type: 'integer', required: true as const },
           height: { type: 'integer', required: true as const },
           name: { type: 'string' },
+          originalDimensions: {
+            type: 'object',
+            description: 'Present only when the attachment store downscaled this image on save: its input dimensions before that normalization.',
+            properties: {
+              width: { type: 'integer' },
+              height: { type: 'integer' },
+            },
+            additionalProperties: false,
+          },
         },
         additionalProperties: false,
       },
