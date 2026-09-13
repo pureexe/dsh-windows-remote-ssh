@@ -387,10 +387,11 @@ class TargetedBackend implements DesktopBackend {
     return result.map(item => expectWindow(item, 'windows'))
   }
 
-  async shot(ref: WindowRef, maxSide: number, signal?: AbortSignal): Promise<Screenshot> {
+  async shot(ref: WindowRef, maxSide: number, wholeScreen: boolean, signal?: AbortSignal): Promise<Screenshot> {
     const result = await this.pool.invoke(this.target, 'shot', {
       target: ref,
       maxSide,
+      wholeScreen,
       maxElements: this.config.maxElements,
       maxDepth: this.config.maxTreeDepth,
     }, signal)

@@ -70,8 +70,10 @@
         staleCheckPixels: true
         # Maximum age in ms of an observation that an action may still base
         # on (1000..600000). Older observations are refused and must be
-        # re-observed.
-        maxObservationAgeMs: 30000
+        # re-observed. Default 300000 (5 minutes) gives the model room for
+        # multi-step reasoning between observing and acting; lower this if
+        # the remote screen tends to change faster than that.
+        maxObservationAgeMs: 300000
         # Cap on cached observations (1..64), LRU-evicted. Actions address
         # observations by the id returned from screen_shot/screen_read.
         maxCachedObservations: 8

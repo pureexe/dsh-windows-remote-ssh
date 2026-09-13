@@ -215,6 +215,15 @@ channels, and SFTP, all from the same process the rest of the plugin runs in.
 2. **Approval** — mutating actions request approval through
    `@deepseek-ai/dsh-user-approval` by default; `autoApproveWindows` regexes
    skip the ask for matched windows but remain freshness-checked and audited.
+   Careful with the harness's own session-wide approval **policy** (`ask` /
+   `never`) — `never` does not mean "never ask, always allow"; per
+   `dsh-user-approval`'s own docs it means "never prompt anyone: every ask
+   resolves `rejected` deterministically," the CI/unattended lockdown stance.
+   Setting it expecting frictionless automation will instead **deny every
+   action** with `action denied by approval: rejected by the approval
+   answerer`. If you don't want per-action prompts, use *this plugin's own*
+   `requireApproval: false` (or a scoped `autoApproveWindows` entry) instead
+   of the harness-wide policy switch.
 3. **Process identity** — PID and executable path are verified immediately
    before and after every action.
 4. **Audit** — every observation and action is logged as

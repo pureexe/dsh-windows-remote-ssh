@@ -116,13 +116,40 @@ describe.skipIf(!hasTarget)('remote Windows host over SSH (live integration)', (
   it('captures a screenshot of the Notepad window', async () => {
     expect(notepadPid).toBeDefined()
     const windowRef: WindowRef = { processId: notepadPid }
-    const shot = await backend.shot(windowRef, 1024)
+    const shot = await backend.shot(windowRef, 1024, false)
     expect(shot.pngBase64.length).toBeGreaterThan(100)
     expect(shot.width).toBeGreaterThan(0)
     expect(shot.height).toBeGreaterThan(0)
     // A PNG signature, once decoded, starts with these bytes.
     const header = Buffer.from(shot.pngBase64, 'base64').subarray(0, 8)
     expect(header.toString('hex')).toBe('89504e470d0a1a0a')
+  })
+
+  it('screen_shot with no target resolves to the foreground window, matching screen_read (regression: used to silently capture the primary screen instead, windowId 0)', async () => {
+    expect(notepadPid).toBeDefined()
+    const shot = await backend.shot({}, 1024, false)
+    // Whatever the actual foreground window is, it must be a real window
+    // (nonzero handle), not the windowId-0 whole-screen sentinel.
+    expect(shot.snapshot.windowId).not.toBe(0)
+    expect(shot.snapshot.foreground).toBe(true)
+  })
+
+  it('screen_shot with wholeScreen: true captures the primary screen with the windowId-0 sentinel', async () => {
+    const shot = await backend.shot({}, 1024, true)
+    expect(shot.snapshot.windowId).toBe(0)
+    expect(shot.snapshot.title).toBe('primary screen')
+    expect(shot.width).toBeGreaterThan(0)
+    expect(shot.height).toBeGreaterThan(0)
+  })
+
+  it('sends a key combination that resolves a letter key (regression: Get-KeyMap crashed building its A-Z table via `foreach ($c in \'A\'..\'Z\')`, which fails converting a plain string to [int] on real Windows PowerShell 5.1 - every `key` call failed, letter or not, since the whole map is built up front)', async () => {
+    expect(notepadPid).toBeDefined()
+    const target: WindowRef = { processId: notepadPid }
+    const tree = await backend.tree(target, 500, 32, false)
+    // Ctrl+A (select all) rather than something destructive/window-closing:
+    // this test just needs the helper to not crash while resolving a letter.
+    const outcome = await backend.key({ windowId: tree.snapshot.windowId, keys: 'Ctrl+A' }, false)
+    expect(outcome.delivered).toBe('posted')
   })
 
   it('connects with a per-call ssh override and no configured default (the runtime-prompted-credentials path)', async () => {

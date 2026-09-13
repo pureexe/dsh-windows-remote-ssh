@@ -151,8 +151,12 @@ function shotDescription(window: ObservedWindowValue, width: number, height: num
 }
 
 /**
- * `screen_shot` — capture the addressed window (or the primary screen) on
- * the remote host. In `imageMode: 'auto'` (the default) the result carries
+ * `screen_shot` — capture the addressed window, or the current foreground
+ * window when none is given (matching `screen_read`'s own no-target
+ * behavior — the two must agree, or a later action's windowId can mismatch
+ * whichever observer it was actually taken from). `wholeScreen: true`
+ * captures the entire primary screen instead (windowId 0; not a valid
+ * `basedOn` target). In `imageMode: 'auto'` (the default) the result carries
  * an image attachment; `imageMode: 'text'` always sends just the
  * description instead.
  */
@@ -161,12 +165,12 @@ export function screenShotTool(services: ToolServices) {
   return defineTool({
     name: 'screen_shot',
     description:
-      'Capture a screenshot of a window (or the primary screen when no window is given) on the remote Windows host reachable over SSH. Returns an observationId that later actions cite in `basedOn`. The result includes the image (unless the plugin is configured with imageMode: "text", in which case it includes only a text description). Read-only: never needs approval.',
+      'Capture a screenshot of a window on the remote Windows host reachable over SSH: the addressed window, or the current foreground window when no target is given (matching screen_read). Pass wholeScreen: true to instead capture the entire primary screen (ignores target) — that capture has no single owning window, so its windowId is 0 and cannot be used as a basedOn target for click/type/scroll/key afterward; use it only to look at multiple windows/the desktop at once. Returns an observationId that later actions cite in `basedOn`. The result includes the image (unless the plugin is configured with imageMode: "text", in which case it includes only a text description). Read-only: never needs approval.',
     parameters: {
       ...sshOverrideParameter,
       target: {
         type: 'object',
-        description: 'Which window to capture (windowId, windowTitle, or processId); omitted = the foreground window.',
+        description: 'Which window to capture (windowId, windowTitle, or processId); omitted = the current foreground window. Ignored when wholeScreen is true.',
         properties: {
           windowId: { type: 'integer', description: 'Native window handle from app_list or screen_read.' },
           windowTitle: { type: 'string', description: 'Visible window title (matched case-insensitively by substring).' },
@@ -174,6 +178,7 @@ export function screenShotTool(services: ToolServices) {
         },
         additionalProperties: false,
       },
+      wholeScreen: { type: 'boolean', description: 'Capture the entire primary screen instead of one window (default false). The result cannot be used as a basedOn target for a later action.' },
       maxSide: { type: 'integer', description: 'Longest side in pixels; larger captures are downscaled.' },
     },
     output: {
@@ -239,13 +244,14 @@ export function screenShotTool(services: ToolServices) {
     },
     timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
     async execute(args, exec) {
-      const parsed = args as { target?: WindowRef; maxSide?: number; ssh?: SshConfig }
+      const parsed = args as { target?: WindowRef; maxSide?: number; wholeScreen?: boolean; ssh?: SshConfig }
       const target = parsed.target ?? {}
+      const wholeScreen = parsed.wholeScreen === true
       const sshTarget = resolveSshTarget(parsed.ssh, config.ssh)
       const backend = getBackend(sshTarget)
       const requestedSide = parsed.maxSide
       const maxSide = requestedSide === undefined ? config.maxScreenshotSide : Math.min(requestedSide, config.maxScreenshotSide)
-      const shot = await backend.shot(target, maxSide, exec.signal)
+      const shot = await backend.shot(target, maxSide, wholeScreen, exec.signal)
       const sanitized = observedWindow(shot.snapshot, config.maxTextLength)
       const record = observations.record(shot.snapshot, sshTarget)
       const description = shotDescription(sanitized, shot.width, shot.height)

@@ -129,8 +129,19 @@ export class ActionExecutor {
       signal,
     })
     if (outcome !== 'allowed-once') {
+      // A `'rejected'` outcome under session policy `'never'` is not a human
+      // (or any answerer) denying this specific action - `dsh-user-approval`
+      // documents `'never'` as "never prompt anyone: every ask resolves
+      // 'rejected' deterministically" (the CI/unattended lockdown stance).
+      // Surface that distinction so "approval denied" doesn't read as this
+      // plugin refusing on its own judgment when it's really the session-wide
+      // policy auto-rejecting everything.
+      const session = exec.agent?.session
+      const policyHint = outcome === 'rejected' && session !== undefined && approval.overrideOf(session) === 'never'
+        ? ' — the session\'s approval policy is set to "never", which auto-rejects every request without prompting anyone (the deterministic CI/unattended stance, not a per-action denial); switch it back to "ask" to be prompted, or set this plugin\'s own requireApproval: false (or an autoApproveWindows entry) if you want these actions to proceed without any prompt'
+        : ''
       throw new RemoteSshError(
-        `action denied by approval: ${APPROVAL_DETAIL[outcome] ?? outcome}`,
+        `action denied by approval: ${APPROVAL_DETAIL[outcome] ?? outcome}${policyHint}`,
         'APPROVAL_DENIED',
       )
     }

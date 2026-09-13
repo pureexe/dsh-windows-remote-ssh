@@ -37,7 +37,7 @@ export const MAX_CONNECT_TIMEOUT_MS = 120_000
 export const DEFAULT_MAX_SCREENSHOT_SIDE = 1600
 export const MIN_SCREENSHOT_SIDE = 320
 export const MAX_SCREENSHOT_SIDE = 7680
-export const DEFAULT_MAX_OBSERVATION_AGE_MS = 30_000
+export const DEFAULT_MAX_OBSERVATION_AGE_MS = 300_000
 export const MIN_OBSERVATION_AGE_MS = 1_000
 export const MAX_OBSERVATION_AGE_MS = 600_000
 export const DEFAULT_MAX_CACHED_OBSERVATIONS = 8
@@ -107,7 +107,7 @@ export interface Config {
   maxScreenshotSide?: number
   /** Compare a fresh pixel hash before every action (default true; the stale-state boundary). */
   staleCheckPixels?: boolean
-  /** Maximum age in ms of an observation that an action may still base on (default 30000). */
+  /** Maximum age in ms of an observation that an action may still base on (default 300000, i.e. 5 minutes). */
   maxObservationAgeMs?: number
   /** Cap on cached observations (default 8). */
   maxCachedObservations?: number

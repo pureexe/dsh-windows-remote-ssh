@@ -441,7 +441,13 @@ function Get-KeyMap() {
   $map['WIN'] = 0x5B; $map['WINDOWS'] = 0x5B
   foreach ($n in 1..12) { $map["F$n"] = 0x6F + $n }
   foreach ($c in 0..9) { $map["$c"] = 0x30 + $c }
-  foreach ($c in 'A'..'Z') { $map[$c] = 0x41 + ([int][char]$c - 65) }
+  # NOT `foreach ($c in 'A'..'Z')`: PowerShell's `..` range operator only
+  # accepts operands it can convert to [int] - a multi-char-looking string
+  # literal like 'A' fails that conversion ("Cannot convert value 'A' to
+  # type System.Int32"), even though it reads like a char range. Loop over
+  # the actual VK/ASCII codes (0x41-0x5A) instead and build the string key
+  # from each one.
+  for ($code = 0x41; $code -le 0x5A; $code++) { $map[[string][char]$code] = $code }
   return $map
 }
 
@@ -598,12 +604,11 @@ function Invoke-OpShot($opArgs) {
   $maxSide = if ($null -ne $opArgs.maxSide) { [int]$opArgs.maxSide } else { 1600 }
   $maxElements = if ($null -ne $opArgs.maxElements) { [int]$opArgs.maxElements } else { 500 }
   $maxDepth = if ($null -ne $opArgs.maxDepth) { [int]$opArgs.maxDepth } else { 32 }
-  $hasTarget = ($null -ne $target.windowId) -or ($null -ne $target.windowTitle) -or ($null -ne $target.processId)
-  if ($hasTarget) {
-    $hwnd = Resolve-Window $target
-    $bitmap = Get-WindowBitmap $hwnd
-    $snapshot = Get-SnapshotRecord $hwnd $maxElements $maxDepth
-  } else {
+  $wholeScreen = if ($null -ne $opArgs.wholeScreen) { [bool]$opArgs.wholeScreen } else { $false }
+  if ($wholeScreen) {
+    # Deliberate, explicit whole-screen capture: windowId 0 is a sentinel
+    # meaning "not one window" and is never a valid basedOn target for a
+    # later action.
     $bitmap = Get-PrimaryBitmap
     $snapshot = @{
       windowId = 0; processId = 0; executablePath = $null
@@ -611,6 +616,14 @@ function Invoke-OpShot($opArgs) {
       rect = @{ x = 0; y = 0; width = $bitmap.Width; height = $bitmap.Height }
       foreground = $true; treeHash = ''; shotHash = ''; elementCount = 0
     }
+  } else {
+    # No target -> the current foreground window, exactly like Invoke-OpTree
+    # (screen_read) with no target - the two observers must agree on this or
+    # a later action's windowId (taken from either) can mismatch the
+    # observation it cites.
+    $hwnd = Resolve-Window $target
+    $bitmap = Get-WindowBitmap $hwnd
+    $snapshot = Get-SnapshotRecord $hwnd $maxElements $maxDepth
   }
   try {
     $bitmap = Resize-BitmapIfNeeded $bitmap $maxSide

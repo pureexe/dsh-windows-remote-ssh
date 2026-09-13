@@ -160,7 +160,15 @@ export interface DesktopBackend {
   readonly unavailableReason?: string
 
   listWindows(signal?: AbortSignal): Promise<WindowInfo[]>
-  shot(ref: WindowRef, maxSide: number, signal?: AbortSignal): Promise<Screenshot>
+  /**
+   * Capture a screenshot. With `wholeScreen: false`, `ref` addresses a
+   * specific window, or — when `ref` is empty — the current foreground
+   * window (matching {@link tree}'s own no-target behavior). With
+   * `wholeScreen: true`, `ref` is ignored and the whole primary screen is
+   * captured instead (`windowId: 0`, a sentinel meaning "not one window" —
+   * not a valid `basedOn` target for a later action).
+   */
+  shot(ref: WindowRef, maxSide: number, wholeScreen: boolean, signal?: AbortSignal): Promise<Screenshot>
   tree(ref: WindowRef, maxElements: number, maxDepth: number, includePixels: boolean, signal?: AbortSignal): Promise<Tree>
   snapshot(windowId: number, signal?: AbortSignal): Promise<WindowSnapshot>
   click(request: ClickRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
