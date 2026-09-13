@@ -624,7 +624,7 @@ export function clickTool(services: ToolServices) {
         additionalProperties: false,
         required: true as const,
       },
-      button: { type: 'string', enum: ['left', 'right'] as const, description: 'Mouse button (default left).' },
+      button: { type: 'string', enum: ['left', 'right'] as const, description: 'Mouse button: the plain string "left" or "right" (default "left"), not an object.' },
     },
     output: {
       schema: actionOutputSchema(false),
@@ -1889,7 +1889,7 @@ export function multiActionTool(services: ToolServices) {
             elementId: { type: 'string', description: 'Element id from screen_read (click or type; required for type).' },
             x: { type: 'integer', description: 'Screen x coordinate (click only, alternative to elementId).' },
             y: { type: 'integer', description: 'Screen y coordinate (click only, alternative to elementId).' },
-            button: { type: 'string', enum: ['left', 'right'] as const, description: 'Mouse button for a click step (default left).' },
+            button: { type: 'string', enum: ['left', 'right'] as const, description: 'Click step only: the plain string "left" or "right" (default "left"), not an object.' },
             selectionMode: {
               type: 'string',
               enum: ['select', 'add', 'remove', 'toggle'] as const,
