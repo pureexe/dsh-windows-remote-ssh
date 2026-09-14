@@ -40,12 +40,17 @@ the target needs to be Windows.
   -WindowStyle Hidden` directly — that flag alone still lets a console flash
   on screen for a moment before it takes effect. Verified empirically: zero
   window sightings across repeated calls while continuously polling for one.
-- **Never steals the user's mouse/keyboard focus.** Actions prefer UI
-  Automation invoke/value/scroll patterns; when an element exposes none, they
-  fall back to *posted* window messages (`WM_LBUTTONDOWN`/`WM_KEYDOWN`/etc.)
-  rather than moving the real cursor or bringing the window to the
-  foreground. Bringing a window to the foreground is available only as an
-  explicit, config-gated fallback (`focusFallback: 'allow'`, default off).
+- **Never steals the user's mouse/keyboard focus, by default.** Actions
+  prefer UI Automation invoke/value/scroll patterns; when an element exposes
+  none, they fall back to *posted* window messages
+  (`WM_LBUTTONDOWN`/`WM_KEYDOWN`/etc.) rather than moving the real cursor or
+  bringing the window to the foreground. Bringing a window to the foreground
+  is available only as an explicit, config-gated fallback
+  (`focusFallback: 'allow'`, default off). A further, more invasive opt-in
+  (`allowHardwareInput: true`, also default off) lets a call pass
+  `hardware: true` to deliver via real `SendInput` events instead — the only
+  way to reach apps that ignore the posted-message queue entirely (games,
+  DirectX/UWP surfaces, raw-input readers); see **`hardware: true`** below.
 
 ## Requirements
 
@@ -144,11 +149,11 @@ With `lazyToolLoading` on (the default), only `pc_control` is registered at star
 | `wait_for` | ✅ | — | Poll (~500ms) until a condition is met or times out, then return a fresh observation |
 | `clipboard` (get) | ✅ | — | Read the remote clipboard text |
 | `process` (list) | ✅ | — | List running processes |
-| `click` | | Yes | Click an element (by id) or a coordinate |
-| `type` | | Yes | Type text into an editable element, with rollback on failure |
-| `scroll` | | Yes | Scroll an element or the window |
-| `key` | | Yes | Send a key combination (e.g. `Ctrl+S`) |
-| `move` | | Yes | Move the mouse, or drag, via posted window messages only |
+| `click` | | Yes | Click an element (by id) or a coordinate (`hardware: true` for real `SendInput`) |
+| `type` | | Yes | Type text into an editable element, with rollback on failure (`hardware: true` for real `SendInput`) |
+| `scroll` | | Yes | Scroll an element or the window (`hardware: true` for real `SendInput`) |
+| `key` | | Yes | Send a key combination (e.g. `Ctrl+S`) (`hardware: true` for real `SendInput`) |
+| `move` | | Yes | Move the mouse, or drag, via posted window messages by default (`hardware: true` for real `SendInput`) |
 | `multi_action` | | Yes | Run a batch of click/type sub-actions (with optional list `selectionMode`) against one observation |
 | `window_control` | | Yes | Minimize/maximize/restore/move/resize/close a window |
 | `app_launch` | | Yes | Launch an application by name or path |
@@ -206,6 +211,37 @@ it back after editing — useful for a config file, a script, or an image.
   stored as a file attachment instead of inlined, so a merely-large file
   doesn't bloat the model's context.
 
+### `hardware: true` — real `SendInput` delivery for apps that ignore posted messages
+
+`click`, `type`, `key`, `scroll`, and `move` all accept an optional
+`hardware: true` argument. When set (and config `allowHardwareInput: true`,
+off by default), the action is delivered as real `SendInput` events — the
+actual OS mouse cursor moves and clicks, real keyboard-level key events are
+injected — instead of UI Automation invoke or posted window messages
+(`WM_LBUTTONDOWN`/`WM_KEYDOWN`/etc.). This exists because posted messages,
+however reliable for ordinary desktop apps, simply never reach some targets:
+games, DirectX/UWP-rendered surfaces, and anything else that reads raw input
+(`GetAsyncKeyState`, `RAWINPUT`) instead of processing the window message
+queue at all. `SendInput` is indistinguishable from a physical mouse/keyboard
+to the receiving app, so it reaches those too.
+
+This is categorically more invasive than `focusFallback: 'allow'` (which only
+brings a window forward but still posts messages): `hardware: true` **always**
+brings the target window to the foreground and moves the real cursor / steals
+real keyboard focus, visible to anyone watching the remote desktop and
+disruptive to whatever the human at that machine was doing. It is off by
+default and must be turned on deliberately via `allowHardwareInput: true`; a
+call that passes `hardware: true` without that config set fails with a clear
+error rather than silently falling back. Once enabled, it is still gated by
+approval like every other mutating action. The action's result reports
+`delivered: "hardware"` when this path was actually used.
+
+One side effect worth knowing: because it's a real hardware event rather than
+a message posted to one window, `hardware: true` on `move`'s `drag` also
+reaches genuine OLE/shell drag-and-drop (e.g. dragging a file between two
+Explorer windows) — the one thing the README's honest limits on posted-message
+drag (below) say plain `move`/`drag` cannot do.
+
 ### `move` — mouse move and drag (posted messages only, honest limits)
 
 `move` posts `WM_MOUSEMOVE` to reach a point inside an observed window and,
@@ -222,9 +258,11 @@ real OLE/shell drag-and-drop: dragging a file between two Explorer windows (or
 anything else that relies on Windows' own drag-detection heuristics and
 `IDropTarget`/`IDataObject` negotiation) generally will **not** work through
 posted messages — that requires actual `SendInput`-driven physical mouse
-events, which this plugin deliberately never generates. Use `move`/`drag` for
+events, which this plugin does not generate by default. Use `move`/`drag` for
 UI manipulation within a single control, not for cross-application drag
-operations.
+operations — unless `hardware: true` is set (see below), which does generate
+real `SendInput` events and does reach real drag-and-drop, at the cost of
+moving the real cursor and stealing focus.
 
 ### `wait_for` — poll for a condition instead of guessing a fixed delay
 
@@ -462,7 +500,7 @@ All fields live under one `Config` object (Schemastery-validated; invalid
 values fail the profile load loudly, not at call time). See the fully
 commented `cordis.patch.yml` for the complete list and defaults:
 `ssh.*`, `lazyToolLoading`, `requireApproval`, `autoApproveWindows`, `auditSessionEvents`,
-`focusFallback`, `imageMode`, `connectTimeoutMs`, `helperTimeoutMs`,
+`focusFallback`, `allowHardwareInput`, `imageMode`, `connectTimeoutMs`, `helperTimeoutMs`,
 `maxScreenshotSide`, `staleCheckTree`, `staleCheckPixels`, `staleCheckPixelsExemptWindows`, `maxObservationAgeMs`,
 `maxCachedObservations`, `maxElements`, `maxTreeDepth`, `maxTextLength`,
 `rollbackEnabled`, `enablePowerShellTool`, `powerShellTimeoutMs`,

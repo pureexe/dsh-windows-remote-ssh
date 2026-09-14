@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { resolveScreenshotMaxSide, shotScaleNote, type ObservedWindowValue } from '../../src/tools.ts'
-import { MAX_SCREENSHOT_SIDE, MIN_SCREENSHOT_SIDE } from '../../src/config.ts'
+import { assertHardwareAllowed, resolveScreenshotMaxSide, shotScaleNote, type ObservedWindowValue } from '../../src/tools.ts'
+import { MAX_SCREENSHOT_SIDE, MIN_SCREENSHOT_SIDE, resolveConfig } from '../../src/config.ts'
 
 function observedWindow(overrides: Partial<ObservedWindowValue['rect']> = {}): ObservedWindowValue {
   return {
@@ -68,5 +68,24 @@ describe('shotScaleNote', () => {
     const downscaledHeightOnly = shotScaleNote(observedWindow({ width: 652, height: 1600 }), 652, 800)
     expect(downscaledHeightOnly).toBeDefined()
     expect(downscaledHeightOnly).toContain('652x1600')
+  })
+})
+
+describe('assertHardwareAllowed', () => {
+  it('is a no-op (returns false) when hardware is not requested, regardless of config', () => {
+    expect(assertHardwareAllowed(resolveConfig({ allowHardwareInput: false }), undefined)).toBe(false)
+    expect(assertHardwareAllowed(resolveConfig({ allowHardwareInput: true }), undefined)).toBe(false)
+    expect(assertHardwareAllowed(resolveConfig({ allowHardwareInput: false }), false)).toBe(false)
+  })
+
+  it('refuses hardware: true with a clear, actionable error when allowHardwareInput is off (the default)', () => {
+    const config = resolveConfig(undefined)
+    expect(config.allowHardwareInput).toBe(false)
+    expect(() => assertHardwareAllowed(config, true)).toThrow(/allowHardwareInput/u)
+  })
+
+  it('allows hardware: true through once allowHardwareInput is on', () => {
+    const config = resolveConfig({ allowHardwareInput: true })
+    expect(assertHardwareAllowed(config, true)).toBe(true)
   })
 })

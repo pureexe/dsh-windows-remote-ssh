@@ -143,6 +143,10 @@ describe('resolveConfig', () => {
     expect(resolved.lazyToolLoading).toBe(true)
     expect(resolved.requireApproval).toBe(true)
     expect(resolved.focusFallback).toBe('never')
+    // Real SendInput delivery moves the actual cursor and steals real
+    // keyboard focus - categorically more invasive than focusFallback, so it
+    // must default OFF, never silently on.
+    expect(resolved.allowHardwareInput).toBe(false)
     expect(resolved.imageMode).toBe('auto')
     expect(resolved.rollbackEnabled).toBe(true)
     expect(resolved.ssh?.remoteWorkdir).toBe('dsh-rssh')
@@ -157,6 +161,17 @@ describe('resolveConfig', () => {
     clearSshEnv()
     const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, enablePowerShellTool: true })
     expect(resolved.enablePowerShellTool).toBe(true)
+  })
+
+  it('accepts an explicit allowHardwareInput: true', () => {
+    clearSshEnv()
+    const resolved = resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, allowHardwareInput: true })
+    expect(resolved.allowHardwareInput).toBe(true)
+  })
+
+  it('rejects a non-boolean allowHardwareInput', () => {
+    clearSshEnv()
+    expect(() => resolveConfig({ ssh: { host: 'h', user: 'u', password: 'p' }, allowHardwareInput: 'yes' as unknown as boolean })).toThrow(/allowHardwareInput/u)
   })
 
   it('accepts an explicit lazyToolLoading: false', () => {

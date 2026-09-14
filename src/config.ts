@@ -156,6 +156,22 @@ export interface Config {
   auditSessionEvents?: boolean
   /** Whether mutating actions may bring the target window to the foreground as a fallback (default 'never'). */
   focusFallback?: FocusFallback
+  /**
+   * Allow `click`/`type`/`key`/`scroll`/`move` to accept `hardware: true` and
+   * deliver via real `SendInput` events (the actual OS cursor moves, real
+   * keyboard/mouse hardware-level input is injected) instead of UIA
+   * invoke/posted window messages (default false). Some apps — games,
+   * DirectX/UWP-rendered surfaces, anything reading raw input or
+   * `GetAsyncKeyState` instead of processing the window message queue —
+   * never react to posted messages no matter what; `SendInput` is
+   * indistinguishable from a real mouse/keyboard and reaches those too. This
+   * is categorically more invasive than `focusFallback: 'allow'`: it always
+   * brings the target window to the foreground AND moves the real cursor /
+   * steals real keyboard focus, visible to whoever (if anyone) is watching
+   * the remote desktop. Off by default; turn on deliberately, still gated by
+   * approval like every other mutating action.
+   */
+  allowHardwareInput?: boolean
   /** How `screen_shot`/`filesystem_pull` render an image: `'auto'` (default) always attaches it; `'text'` always sends only a description/generic file attachment (e.g. for a model route capping images per prompt). */
   imageMode?: ImageMode
   /** Per-SSH-connect timeout in milliseconds (default 20000). */
@@ -278,6 +294,7 @@ export interface ResolvedConfig {
   autoApproveMatchers: ReadonlyArray<RegExp>
   auditSessionEvents: boolean
   focusFallback: FocusFallback
+  allowHardwareInput: boolean
   imageMode: ImageMode
   connectTimeoutMs: number
   helperTimeoutMs: number
@@ -320,6 +337,7 @@ export const Config: z<Config> = z.object({
   autoApproveWindows: z.array(z.string()).default([]),
   auditSessionEvents: z.boolean().default(true),
   focusFallback: z.union(['never', 'allow'] as const).default('never'),
+  allowHardwareInput: z.boolean().default(false),
   imageMode: z.union(['auto', 'text'] as const).default('auto'),
   connectTimeoutMs: z.number().min(1).max(MAX_CONNECT_TIMEOUT_MS).default(DEFAULT_CONNECT_TIMEOUT_MS),
   helperTimeoutMs: z.number().min(1).max(MAX_HELPER_TIMEOUT_MS).default(DEFAULT_HELPER_TIMEOUT_MS),
@@ -562,6 +580,9 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
   const focusFallback = config?.focusFallback ?? 'never'
   if (focusFallback !== 'never' && focusFallback !== 'allow') invalid('focusFallback', 'must be "never" or "allow"')
 
+  const allowHardwareInput = config?.allowHardwareInput ?? false
+  if (typeof allowHardwareInput !== 'boolean') invalid('allowHardwareInput', 'must be a boolean')
+
   const imageMode = config?.imageMode ?? 'auto'
   if (imageMode !== 'auto' && imageMode !== 'text') invalid('imageMode', 'must be "auto" or "text"')
 
@@ -670,6 +691,7 @@ export function resolveConfig(config: Config | undefined): ResolvedConfig {
     autoApproveMatchers: Object.freeze(autoApproveMatchers),
     auditSessionEvents,
     focusFallback,
+    allowHardwareInput,
     imageMode,
     connectTimeoutMs,
     helperTimeoutMs,

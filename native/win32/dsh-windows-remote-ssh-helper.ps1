@@ -108,6 +108,118 @@ public static class DshRemoteWin32 {
     public int Left; public int Top; public int Right; public int Bottom;
   }
 
+  // ---------------------------------------------------------------------
+  // Real hardware input (SendInput) - the opt-in "hardware: true" delivery
+  // mode (config allowHardwareInput). Unlike every other action in this
+  // file, these actually move the OS cursor and inject real keyboard/mouse
+  // events indistinguishable from a physical device - the only way to reach
+  // apps that ignore the posted-message queue entirely (games, DirectX/UWP
+  // surfaces, anything polling raw input / GetAsyncKeyState). The standard
+  // Win32 INPUT union layout (LayoutKind.Explicit, mouse/keyboard/hardware
+  // structs overlaid at offset 0) is used here rather than two competing
+  // P/Invoke signatures for the same native struct.
+  [StructLayout(LayoutKind.Sequential)]
+  public struct MOUSEINPUT {
+    public int dx; public int dy;
+    public uint mouseData; public uint dwFlags; public uint time;
+    public IntPtr dwExtraInfo;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct KEYBDINPUT {
+    public ushort wVk; public ushort wScan;
+    public uint dwFlags; public uint time;
+    public IntPtr dwExtraInfo;
+  }
+
+  [StructLayout(LayoutKind.Explicit)]
+  public struct INPUTUNION {
+    [FieldOffset(0)] public MOUSEINPUT mi;
+    [FieldOffset(0)] public KEYBDINPUT ki;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct HWINPUT {
+    public uint type;
+    public INPUTUNION u;
+  }
+
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern uint SendInput(uint nInputs, HWINPUT[] pInputs, int cbSize);
+
+  public const uint HW_INPUT_MOUSE = 0;
+  public const uint HW_INPUT_KEYBOARD = 1;
+  public const uint HW_MOUSEEVENTF_MOVE = 0x0001;
+  public const uint HW_MOUSEEVENTF_ABSOLUTE = 0x8000;
+  public const uint HW_MOUSEEVENTF_VIRTUALDESK = 0x4000;
+  public const uint HW_MOUSEEVENTF_LEFTDOWN = 0x0002;
+  public const uint HW_MOUSEEVENTF_LEFTUP = 0x0004;
+  public const uint HW_MOUSEEVENTF_RIGHTDOWN = 0x0008;
+  public const uint HW_MOUSEEVENTF_RIGHTUP = 0x0010;
+  public const uint HW_MOUSEEVENTF_WHEEL = 0x0800;
+  public const uint HW_KEYEVENTF_KEYUP = 0x0002;
+  public const uint HW_KEYEVENTF_UNICODE = 0x0004;
+  public const int SM_XVIRTUALSCREEN = 76;
+  public const int SM_YVIRTUALSCREEN = 77;
+  public const int SM_CXVIRTUALSCREEN = 78;
+  public const int SM_CYVIRTUALSCREEN = 79;
+
+  /**
+   * Move the real OS cursor to one absolute SCREEN coordinate (the same
+   * space as every window rect this plugin already reports). Normalized
+   * against the full virtual desktop's bounds - not a hardcoded resolution -
+   * so this works correctly on any display size/DPI and on multi-monitor
+   * setups where a monitor to the left of/above the primary has negative
+   * coordinates.
+   */
+  public static void HardwareMoveTo(int screenX, int screenY) {
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = Math.Max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1);
+    int vh = Math.Max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1);
+    var input = new HWINPUT();
+    input.type = HW_INPUT_MOUSE;
+    input.u.mi.dx = (int)(((long)(screenX - vx) * 65536) / vw);
+    input.u.mi.dy = (int)(((long)(screenY - vy) * 65536) / vh);
+    input.u.mi.dwFlags = HW_MOUSEEVENTF_MOVE | HW_MOUSEEVENTF_ABSOLUTE | HW_MOUSEEVENTF_VIRTUALDESK;
+    SendInput(1, new HWINPUT[] { input }, Marshal.SizeOf(typeof(HWINPUT)));
+  }
+
+  public static void HardwareMouseButton(uint flag) {
+    var input = new HWINPUT();
+    input.type = HW_INPUT_MOUSE;
+    input.u.mi.dwFlags = flag;
+    SendInput(1, new HWINPUT[] { input }, Marshal.SizeOf(typeof(HWINPUT)));
+  }
+
+  public static void HardwareWheel(int delta) {
+    var input = new HWINPUT();
+    input.type = HW_INPUT_MOUSE;
+    input.u.mi.mouseData = unchecked((uint)delta);
+    input.u.mi.dwFlags = HW_MOUSEEVENTF_WHEEL;
+    SendInput(1, new HWINPUT[] { input }, Marshal.SizeOf(typeof(HWINPUT)));
+  }
+
+  public static void HardwareKeyEvent(ushort vk, bool keyUp) {
+    var input = new HWINPUT();
+    input.type = HW_INPUT_KEYBOARD;
+    input.u.ki.wVk = vk;
+    input.u.ki.dwFlags = keyUp ? HW_KEYEVENTF_KEYUP : 0;
+    SendInput(1, new HWINPUT[] { input }, Marshal.SizeOf(typeof(HWINPUT)));
+  }
+
+  public static void HardwareTypeChar(char c) {
+    var down = new HWINPUT();
+    down.type = HW_INPUT_KEYBOARD;
+    down.u.ki.wScan = c;
+    down.u.ki.dwFlags = HW_KEYEVENTF_UNICODE;
+    var up = new HWINPUT();
+    up.type = HW_INPUT_KEYBOARD;
+    up.u.ki.wScan = c;
+    up.u.ki.dwFlags = HW_KEYEVENTF_UNICODE | HW_KEYEVENTF_KEYUP;
+    SendInput(2, new HWINPUT[] { down, up }, Marshal.SizeOf(typeof(HWINPUT)));
+  }
+
   public static IntPtr[] EnumVisibleWindows() {
     var list = new List<IntPtr>();
     EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
@@ -439,6 +551,103 @@ function Post-Click($hwnd, $cx, $cy, $button) {
   $lparam = Get-LParam $cx $cy
   [void][DshRemoteWin32]::PostMessage($hwnd, $down, [IntPtr]1, $lparam)
   [void][DshRemoteWin32]::PostMessage($hwnd, $up, [IntPtr]0, $lparam)
+}
+
+# ---------------------------------------------------------------------------
+# Real hardware input (SendInput) delivery - "hardware: true" (config
+# allowHardwareInput). Every function here takes/produces real SCREEN
+# coordinates (never client-relative - HardwareMoveTo normalizes against the
+# real virtual-desktop bounds, not a hardcoded resolution) and always brings
+# the target window to the foreground first: SendInput is global, not scoped
+# to a window, so a mouse click lands on whatever is actually topmost at that
+# screen point and keyboard events go to whatever currently has focus.
+# ---------------------------------------------------------------------------
+function Assert-ScreenPointInWindow($windowRect, $x, $y) {
+  if ($x -lt $windowRect.x -or $y -lt $windowRect.y -or $x -ge ($windowRect.x + $windowRect.width) -or $y -ge ($windowRect.y + $windowRect.height)) {
+    throw "point ($x, $y) lies outside the target window"
+  }
+}
+
+function Send-HardwareButtonDown($button) {
+  $flag = [DshRemoteWin32]::HW_MOUSEEVENTF_LEFTDOWN
+  if ($button -eq 'right') { $flag = [DshRemoteWin32]::HW_MOUSEEVENTF_RIGHTDOWN }
+  [DshRemoteWin32]::HardwareMouseButton($flag)
+}
+
+function Send-HardwareButtonUp($button) {
+  $flag = [DshRemoteWin32]::HW_MOUSEEVENTF_LEFTUP
+  if ($button -eq 'right') { $flag = [DshRemoteWin32]::HW_MOUSEEVENTF_RIGHTUP }
+  [DshRemoteWin32]::HardwareMouseButton($flag)
+}
+
+function Send-HardwareClick($screenX, $screenY, $button) {
+  [DshRemoteWin32]::HardwareMoveTo($screenX, $screenY)
+  Start-Sleep -Milliseconds 20
+  Send-HardwareButtonDown $button
+  Start-Sleep -Milliseconds 30
+  Send-HardwareButtonUp $button
+}
+
+function Send-HardwareDrag($sourceX, $sourceY, $destX, $destY, $button, $steps = 20) {
+  [DshRemoteWin32]::HardwareMoveTo($sourceX, $sourceY)
+  Start-Sleep -Milliseconds 20
+  Send-HardwareButtonDown $button
+  for ($s = 1; $s -le $steps; $s++) {
+    $x = [int]($sourceX + ($destX - $sourceX) * $s / $steps)
+    $y = [int]($sourceY + ($destY - $sourceY) * $s / $steps)
+    [DshRemoteWin32]::HardwareMoveTo($x, $y)
+    Start-Sleep -Milliseconds 15
+  }
+  Send-HardwareButtonUp $button
+}
+
+function Send-HardwareWheel($screenX, $screenY, $delta) {
+  [DshRemoteWin32]::HardwareMoveTo($screenX, $screenY)
+  Start-Sleep -Milliseconds 20
+  [DshRemoteWin32]::HardwareWheel($delta)
+}
+
+function Send-HardwareType($text) {
+  foreach ($c in $text.ToCharArray()) {
+    [DshRemoteWin32]::HardwareTypeChar($c) | Out-Null
+    Start-Sleep -Milliseconds 15
+  }
+}
+
+function Send-HardwareKeyCombo($keysText, $keyMap) {
+  $tokens = @()
+  foreach ($token in ($keysText -split '\+')) {
+    $trimmed = $token.Trim()
+    if ($trimmed.Length -eq 0) { continue }
+    $tokens += $trimmed.ToUpperInvariant()
+  }
+  if ($tokens.Count -eq 0) { throw 'empty key combination' }
+  $modifiers = @()
+  $mainKeys = @()
+  foreach ($token in $tokens) {
+    if ($script:ModifierNames -contains $token) {
+      $modifiers += $token
+    } elseif ($keyMap.ContainsKey($token)) {
+      $mainKeys += $token
+    } elseif ($token.Length -eq 1) {
+      $mainKeys += $token
+    } else {
+      throw "unknown key '$token'"
+    }
+  }
+  foreach ($modifier in $modifiers) {
+    [DshRemoteWin32]::HardwareKeyEvent([uint16]$keyMap[$modifier], $false)
+    Start-Sleep -Milliseconds 20
+  }
+  foreach ($key in $mainKeys) {
+    $vk = if ($keyMap.ContainsKey($key)) { [uint16]$keyMap[$key] } else { [uint16][char]::ToUpper($key[0]) }
+    [DshRemoteWin32]::HardwareKeyEvent($vk, $false)
+    Start-Sleep -Milliseconds 30
+    [DshRemoteWin32]::HardwareKeyEvent($vk, $true)
+  }
+  for ($i = $modifiers.Count - 1; $i -ge 0; $i--) {
+    [DshRemoteWin32]::HardwareKeyEvent([uint16]$keyMap[$modifiers[$i]], $true)
+  }
 }
 
 function Get-KeyMap() {
@@ -787,8 +996,9 @@ function Invoke-SelectionItemAction($element, $selectionMode) {
 function Invoke-OpClick($opArgs) {
   $request = $opArgs.request
   $focusFallback = if ($null -ne $opArgs.focusFallback) { [bool]$opArgs.focusFallback } else { $false }
+  $hardware = if ($null -ne $request.hardware) { [bool]$request.hardware } else { $false }
   $hwnd = Resolve-Window @{ windowId = $request.windowId }
-  if ($focusFallback) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
+  if ($focusFallback -or $hardware) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
   $windowRect = Get-WindowRectInfo $hwnd
   $windowElement = Get-UiaElement $hwnd
   $delivered = 'posted'
@@ -799,6 +1009,10 @@ function Invoke-OpClick($opArgs) {
     if ($null -eq $element) { throw "element '$($request.elementId)' not found in window $hwnd (re-run screen_read)" }
     if ($hasSelectionMode -and (Invoke-SelectionItemAction $element $selectionMode)) {
       $delivered = 'uia'
+    } elseif ($hardware) {
+      $center = Get-ElementCenter $element
+      Send-HardwareClick $center.x $center.y ([string]$request.button)
+      $delivered = 'hardware'
     } else {
       $invoke = $null
       if ($element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
@@ -813,9 +1027,15 @@ function Invoke-OpClick($opArgs) {
     }
   } else {
     if ($null -eq $request.x -or $null -eq $request.y) { throw 'click requires elementId or (x, y)' }
-    $client = Get-ClientPoint $windowRect ([int]$request.x) ([int]$request.y)
-    Post-Click $hwnd $client.x $client.y ([string]$request.button)
-    $delivered = 'posted'
+    if ($hardware) {
+      Assert-ScreenPointInWindow $windowRect ([int]$request.x) ([int]$request.y)
+      Send-HardwareClick ([int]$request.x) ([int]$request.y) ([string]$request.button)
+      $delivered = 'hardware'
+    } else {
+      $client = Get-ClientPoint $windowRect ([int]$request.x) ([int]$request.y)
+      Post-Click $hwnd $client.x $client.y ([string]$request.button)
+      $delivered = 'posted'
+    }
   }
   return (Get-ActionOutcome $hwnd 'click' $delivered $null $null)
 }
@@ -823,12 +1043,24 @@ function Invoke-OpClick($opArgs) {
 function Invoke-OpType($opArgs) {
   $request = $opArgs.request
   $focusFallback = if ($null -ne $opArgs.focusFallback) { [bool]$opArgs.focusFallback } else { $false }
+  $hardware = if ($null -ne $request.hardware) { [bool]$request.hardware } else { $false }
   $rollback = if ($null -ne $request.rollback) { [bool]$request.rollback } else { $true }
   $hwnd = Resolve-Window @{ windowId = $request.windowId }
-  if ($focusFallback) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
+  if ($focusFallback -or $hardware) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
   $windowElement = Get-UiaElement $hwnd
   $element = Find-ElementByRuntimeId $windowElement ([string]$request.elementId)
   if ($null -eq $element) { throw "element '$($request.elementId)' not found in window $hwnd (re-run screen_read)" }
+  if ($hardware) {
+    # Real SendInput Unicode key events go to whatever currently has keyboard
+    # focus - not scoped to this element by anything but that focus - so
+    # click it first (a real hardware click at its center) to actually focus
+    # it before typing, regardless of what patterns it supports.
+    $center = Get-ElementCenter $element
+    Send-HardwareClick $center.x $center.y 'left'
+    Start-Sleep -Milliseconds 50
+    Send-HardwareType ([string]$request.text)
+    return (Get-ActionOutcome $hwnd 'type' 'hardware' $false $null)
+  }
   $value = $null
   if ($element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value)) {
     $original = [string]$value.Current.Value
@@ -859,6 +1091,7 @@ function Invoke-OpType($opArgs) {
 function Invoke-OpScroll($opArgs) {
   $request = $opArgs.request
   $focusFallback = if ($null -ne $opArgs.focusFallback) { [bool]$opArgs.focusFallback } else { $false }
+  $hardware = if ($null -ne $request.hardware) { [bool]$request.hardware } else { $false }
   $amount = if ($null -ne $request.amount) { [int]$request.amount } else { 3 }
   if ($amount -lt 1) { throw 'scroll amount must be positive' }
   $hwnd = Resolve-Window @{ windowId = $request.windowId }
@@ -886,15 +1119,22 @@ function Invoke-OpScroll($opArgs) {
     }
     return (Get-ActionOutcome $hwnd 'scroll' 'uia' $null $null)
   }
-  if ($focusFallback) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
   $direction = [string]$request.direction
   $page = ($direction -eq 'page-up' -or $direction -eq 'page-down')
   $sign = if ($direction -eq 'up' -or $direction -eq 'page-up') { 1 } else { -1 }
   $notches = if ($page) { 3 } else { 1 }
   $delta = [int]($sign * $notches * $amount * 120)
-  $wparam = [IntPtr][int64]($delta * 65536)
   $rect = Get-WindowRectInfo $hwnd
-  $client = Get-ClientPoint $rect ([int]($rect.x + $rect.width / 2)) ([int]($rect.y + $rect.height / 2))
+  $centerX = [int]($rect.x + $rect.width / 2)
+  $centerY = [int]($rect.y + $rect.height / 2)
+  if ($hardware) {
+    [void][DshRemoteWin32]::SetForegroundWindow($hwnd)
+    Send-HardwareWheel $centerX $centerY $delta
+    return (Get-ActionOutcome $hwnd 'scroll' 'hardware' $null 'real SendInput wheel event at the window center')
+  }
+  if ($focusFallback) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
+  $wparam = [IntPtr][int64]($delta * 65536)
+  $client = Get-ClientPoint $rect $centerX $centerY
   [void][DshRemoteWin32]::PostMessage($hwnd, 0x20A, $wparam, (Get-LParam $client.x $client.y))
   return (Get-ActionOutcome $hwnd 'scroll' 'posted' $null 'posted wheel message to the window')
 }
@@ -902,8 +1142,13 @@ function Invoke-OpScroll($opArgs) {
 function Invoke-OpKey($opArgs) {
   $request = $opArgs.request
   $focusFallback = if ($null -ne $opArgs.focusFallback) { [bool]$opArgs.focusFallback } else { $false }
+  $hardware = if ($null -ne $request.hardware) { [bool]$request.hardware } else { $false }
   $hwnd = Resolve-Window @{ windowId = $request.windowId }
-  if ($focusFallback) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
+  if ($focusFallback -or $hardware) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
+  if ($hardware) {
+    Send-HardwareKeyCombo ([string]$request.keys) (Get-KeyMap)
+    return (Get-ActionOutcome $hwnd 'key' 'hardware' $null $null)
+  }
   Post-KeyCombo $hwnd ([string]$request.keys)
   return (Get-ActionOutcome $hwnd 'key' 'posted' $null $null)
 }
@@ -917,32 +1162,44 @@ function Post-MouseMove($hwnd, $cx, $cy, $buttonDown) {
 function Invoke-OpMove($opArgs) {
   $request = $opArgs.request
   $focusFallback = if ($null -ne $opArgs.focusFallback) { [bool]$opArgs.focusFallback } else { $false }
+  $hardware = if ($null -ne $request.hardware) { [bool]$request.hardware } else { $false }
   $hwnd = Resolve-Window @{ windowId = $request.windowId }
-  if ($focusFallback) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
+  if ($focusFallback -or $hardware) { [void][DshRemoteWin32]::SetForegroundWindow($hwnd) }
   $windowRect = Get-WindowRectInfo $hwnd
   $windowElement = Get-UiaElement $hwnd
 
-  function Resolve-MovePoint($elementId, $x, $y) {
+  function Resolve-ScreenPoint($elementId, $x, $y) {
     if ($null -ne $elementId -and $elementId -is [string] -and $elementId.Length -gt 0) {
       $element = Find-ElementByRuntimeId $windowElement ([string]$elementId)
       if ($null -eq $element) { throw "element '$elementId' not found in window $hwnd (re-run screen_read)" }
-      $center = Get-ElementCenter $element
-      return Get-ClientPoint $windowRect $center.x $center.y
+      return Get-ElementCenter $element
     }
-    return Get-ClientPoint $windowRect ([int]$x) ([int]$y)
+    Assert-ScreenPointInWindow $windowRect ([int]$x) ([int]$y)
+    return @{ x = [int]$x; y = [int]$y }
   }
 
-  $source = Resolve-MovePoint $request.elementId $request.x $request.y
+  $sourceScreen = Resolve-ScreenPoint $request.elementId $request.x $request.y
   $drag = $request.drag
   if ($null -ne $drag) {
-    $destination = Resolve-MovePoint $drag.toElementId $drag.toX $drag.toY
+    $destScreen = Resolve-ScreenPoint $drag.toElementId $drag.toX $drag.toY
+    if ($hardware) {
+      # Real SendInput drag: the OS cursor actually moves and real button
+      # events fire, so this reaches genuine OLE/shell drag-and-drop (e.g.
+      # between two Explorer windows) as well as controls that only react to
+      # simple mouse events - unlike the posted-message path below.
+      Send-HardwareDrag $sourceScreen.x $sourceScreen.y $destScreen.x $destScreen.y 'left'
+      return (Get-ActionOutcome $hwnd 'move' 'hardware' $null 'dragged via real SendInput mouse events (reaches real OLE/shell drag-and-drop)')
+    }
+    $source = Get-ClientPoint $windowRect $sourceScreen.x $sourceScreen.y
+    $destination = Get-ClientPoint $windowRect $destScreen.x $destScreen.y
     # Posted-message drag only: WM_MOUSEMOVE to the source, WM_LBUTTONDOWN,
     # several interpolated WM_MOUSEMOVE steps with the button held, then
     # WM_LBUTTONUP at the destination. This works for controls that react to
     # simple mouse-move/button events (sliders, canvases, custom-drawn
     # controls) - it is NOT real OLE/shell drag-and-drop (e.g. dragging a
     # file between two Explorer windows), which requires actual
-    # SendInput-driven drag detection that posted messages cannot trigger.
+    # SendInput-driven drag detection that posted messages cannot trigger
+    # (use hardware: true for that instead).
     Post-MouseMove $hwnd $source.x $source.y $false
     [void][DshRemoteWin32]::PostMessage($hwnd, 0x201, [IntPtr]1, (Get-LParam $source.x $source.y))  # WM_LBUTTONDOWN
     $steps = 10
@@ -955,6 +1212,11 @@ function Invoke-OpMove($opArgs) {
     [void][DshRemoteWin32]::PostMessage($hwnd, 0x202, [IntPtr]0, (Get-LParam $destination.x $destination.y))  # WM_LBUTTONUP
     return (Get-ActionOutcome $hwnd 'move' 'posted' $null 'dragged via posted mouse messages (works only for controls that react to simple mouse events - not real OLE/shell drag-and-drop)')
   }
+  if ($hardware) {
+    [DshRemoteWin32]::HardwareMoveTo($sourceScreen.x, $sourceScreen.y)
+    return (Get-ActionOutcome $hwnd 'move' 'hardware' $null $null)
+  }
+  $source = Get-ClientPoint $windowRect $sourceScreen.x $sourceScreen.y
   Post-MouseMove $hwnd $source.x $source.y $false
   return (Get-ActionOutcome $hwnd 'move' 'posted' $null $null)
 }

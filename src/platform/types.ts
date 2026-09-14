@@ -122,6 +122,8 @@ export interface ClickRequest {
   button: 'left' | 'right'
   /** Use the SelectionItem pattern (Select/AddToSelection/RemoveFromSelection) instead of a plain click, when the element supports it. */
   selectionMode?: SelectionMode
+  /** Deliver via real `SendInput` (real cursor, real click) instead of UIA/posted messages. Requires config `allowHardwareInput: true`. */
+  hardware?: boolean
 }
 
 /** A type request addressed to a value-pattern element. */
@@ -130,6 +132,8 @@ export interface TypeRequest {
   elementId: string
   text: string
   rollback: boolean
+  /** Deliver via real `SendInput` Unicode key events instead of the UIA value pattern / posted WM_CHAR. Requires config `allowHardwareInput: true`. */
+  hardware?: boolean
 }
 
 /** A scroll request. */
@@ -138,12 +142,16 @@ export interface ScrollRequest {
   elementId?: string
   direction: 'up' | 'down' | 'page-up' | 'page-down'
   amount: number
+  /** Deliver the wheel via real `SendInput` instead of a posted WM_MOUSEWHEEL. Ignored when `elementId` resolves to a Scroll-pattern element (UIA is used instead regardless). Requires config `allowHardwareInput: true`. */
+  hardware?: boolean
 }
 
 /** A key-combination request (e.g. "Ctrl+S", "Enter"). */
 export interface KeyRequest {
   windowId: number
   keys: string
+  /** Deliver via real `SendInput` keyboard events instead of posted WM_KEYDOWN/WM_KEYUP. Requires config `allowHardwareInput: true`. */
+  hardware?: boolean
 }
 
 /**
@@ -164,6 +172,14 @@ export interface MoveRequest {
     toY?: number
     toElementId?: string
   }
+  /**
+   * Deliver via real `SendInput` (the actual OS cursor moves/drags) instead
+   * of posted messages. Requires config `allowHardwareInput: true`. Unlike
+   * plain posted-message drag, this reaches real OLE/shell drag-and-drop
+   * (e.g. between two Explorer windows), since it generates real hardware
+   * mouse events.
+   */
+  hardware?: boolean
 }
 
 /**
@@ -284,7 +300,7 @@ export interface CaptureOptions {
 export interface ActionOutcome {
   windowId: number
   action: string
-  delivered: 'uia' | 'posted' | 'none'
+  delivered: 'uia' | 'posted' | 'hardware' | 'none'
   processBefore: ProcessFacts
   processAfter: ProcessFacts
   restored?: boolean
@@ -339,12 +355,16 @@ export interface DesktopBackend {
   key(request: KeyRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
   /**
    * Move the mouse (and, with `request.drag`, drag) inside the addressed
-   * window entirely via posted window messages — the real OS cursor never
+   * window via posted window messages by default — the real OS cursor never
    * moves. Honest limits: this reliably works for controls that react to
    * simple mouse-move/button events (sliders, canvases, custom-drawn
    * controls); it is NOT real OLE/shell drag-and-drop (e.g. dragging a file
    * between two Explorer windows), which requires actual `SendInput`-driven
-   * drag detection that posted messages cannot trigger.
+   * drag detection that posted messages cannot trigger. `request.hardware:
+   * true` (config `allowHardwareInput` required) switches to real
+   * `SendInput` events instead, which does reach real OLE/shell drag-and-drop
+   * and apps that ignore posted input entirely — at the cost of moving the
+   * real cursor and bringing the window to the foreground.
    */
   move(request: MoveRequest, focusFallback: boolean, signal?: AbortSignal): Promise<ActionOutcome>
   /** Change a window's state: minimize/maximize/restore/move/resize/close. */

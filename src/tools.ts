@@ -581,7 +581,7 @@ function actionOutputSchema(withRestored: boolean) {
     properties: {
       ok: { type: 'boolean' as const, const: true },
       windowId: { type: 'integer' as const },
-      delivered: { type: 'string' as const, enum: ['uia', 'posted', 'none'] as const },
+      delivered: { type: 'string' as const, enum: ['uia', 'posted', 'hardware', 'none'] as const },
       process: {
         type: 'object' as const,
         properties: {
@@ -625,6 +625,37 @@ const basedOnParameters = {
   },
 }
 
+/**
+ * The optional `hardware` parameter shared by `click`/`type`/`key`/`scroll`/
+ * `move`: real `SendInput` delivery for apps that ignore posted messages
+ * entirely (games, DirectX/UWP surfaces, anything reading raw input instead
+ * of the window message queue). Only usable when config `allowHardwareInput`
+ * is on — {@link assertHardwareAllowed} enforces that at call time with a
+ * clear error, since it's off by default.
+ */
+const hardwareParameter = {
+  hardware: {
+    type: 'boolean' as const,
+    description:
+      'Deliver via real SendInput (actual OS cursor/keyboard events) instead of UIA/posted messages, for apps that ignore posted input entirely '
+      + '(games, DirectX/UWP surfaces, raw-input readers). Requires config allowHardwareInput: true. Always brings the window to the foreground '
+      + 'and moves the real cursor / steals real keyboard focus — more invasive than the default delivery. Default false.',
+  },
+}
+
+/** Refuse `hardware: true` up front with a clear, actionable error when the deployment hasn't opted in. */
+export function assertHardwareAllowed(config: ResolvedConfig, requested: boolean | undefined): boolean {
+  if (requested !== true) return false
+  if (!config.allowHardwareInput) {
+    throw new Error(
+      'hardware: true requires config.allowHardwareInput: true — it delivers via real SendInput events (moves the actual OS cursor, '
+      + 'steals real keyboard focus), which is off by default. Enable it deliberately in this plugin\'s config if posted-message/UIA '
+      + 'delivery genuinely does not reach this target (e.g. a game or DirectX/UWP surface).',
+    )
+  }
+  return true
+}
+
 /** One-line action summary for render text. */
 function actionLine(toolName: string, value: {
   windowId: number
@@ -647,7 +678,7 @@ export function clickTool(services: ToolServices) {
   return defineTool({
     name: 'click',
     description:
-      'Click an element (elementId) or coordinate in an observed window. Requires `basedOn`; fails if the screen changed since. Never steals focus. Requires approval unless allowlisted.',
+      'Click an element (elementId) or coordinate in an observed window. Requires `basedOn`; fails if the screen changed since. Never steals focus (unless hardware: true). Requires approval unless allowlisted.',
     parameters: {
       ...basedOnParameters,
       target: {
@@ -662,6 +693,7 @@ export function clickTool(services: ToolServices) {
         required: true as const,
       },
       button: { type: 'string', enum: ['left', 'right'] as const, description: 'Mouse button: the plain string "left" or "right" (default "left"), not an object.' },
+      ...hardwareParameter,
     },
     output: {
       schema: actionOutputSchema(false),
@@ -671,18 +703,20 @@ export function clickTool(services: ToolServices) {
     },
     timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
     async execute(args, exec) {
-      const parsed = args as { basedOn: { observationId: string; windowId: number }; target: { elementId?: string; x?: number; y?: number }; button?: 'left' | 'right' }
+      const parsed = args as { basedOn: { observationId: string; windowId: number }; target: { elementId?: string; x?: number; y?: number }; button?: 'left' | 'right'; hardware?: boolean }
       const target = parsed.target
       const byElement = target.elementId !== undefined
       const byPoint = target.x !== undefined && target.y !== undefined
       if (byElement === byPoint) {
         throw new Error('click target must name exactly one of elementId or (x, y)')
       }
+      const hardware = assertHardwareAllowed(config, parsed.hardware)
       const outcome = await actions.perform('click', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, (focusFallback, backend) =>
         backend.click({
           windowId: parsed.basedOn.windowId,
           ...byElement ? { elementId: target.elementId as string } : { x: target.x as number, y: target.y as number },
           button: parsed.button ?? 'left',
+          ...hardware ? { hardware: true } : {},
         }, focusFallback, exec.signal),
         // By elementId: the helper re-resolves that exact element by its UIA
         // RuntimeId right before clicking and fails loudly if it's gone, so
@@ -710,11 +744,12 @@ export function typeTool(services: ToolServices) {
   return defineTool({
     name: 'type',
     description:
-      'Type text into an editable element (elementId; needs a value pattern). Requires `basedOn`; fails if the screen changed since. Never steals focus. Requires approval unless allowlisted. Restores prior text on failure if rollback is enabled.',
+      'Type text into an editable element (elementId; needs a value pattern, unless hardware: true). Requires `basedOn`; fails if the screen changed since. Never steals focus (unless hardware: true). Requires approval unless allowlisted. Restores prior text on failure if rollback is enabled.',
     parameters: {
       ...basedOnParameters,
       elementId: { type: 'string', description: 'Editable element id from screen_read.', required: true as const },
       text: { type: 'string', description: 'The exact text to type (up to 10000 characters).', required: true as const },
+      ...hardwareParameter,
     },
     output: {
       schema: actionOutputSchema(true),
@@ -724,16 +759,18 @@ export function typeTool(services: ToolServices) {
     },
     timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
     async execute(args, exec) {
-      const parsed = args as { basedOn: { observationId: string; windowId: number }; elementId: string; text: string }
+      const parsed = args as { basedOn: { observationId: string; windowId: number }; elementId: string; text: string; hardware?: boolean }
       if (parsed.text.length > 10_000) {
         throw new Error('type text must be at most 10000 characters')
       }
+      const hardware = assertHardwareAllowed(config, parsed.hardware)
       const outcome = await actions.perform('type', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, (focusFallback, backend) =>
         backend.type({
           windowId: parsed.basedOn.windowId,
           elementId: parsed.elementId,
           text: parsed.text,
           rollback: config.rollbackEnabled,
+          ...hardware ? { hardware: true } : {},
         }, focusFallback, exec.signal),
         // elementId is mandatory here: the helper always re-resolves it by
         // UIA RuntimeId right before typing and fails loudly if it's gone,
@@ -767,6 +804,7 @@ export function scrollTool(services: ToolServices) {
       elementId: { type: 'string', description: 'Optional scrollable element id from screen_read; omitted = scroll the window itself.' },
       direction: { type: 'string', enum: ['up', 'down', 'page-up', 'page-down'] as const, description: 'Scroll direction.', required: true as const },
       amount: { type: 'integer', description: 'Number of increments (default 3).' },
+      ...hardwareParameter,
     },
     output: {
       schema: actionOutputSchema(false),
@@ -776,17 +814,19 @@ export function scrollTool(services: ToolServices) {
     },
     timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
     async execute(args, exec) {
-      const parsed = args as { basedOn: { observationId: string; windowId: number }; elementId?: string; direction: 'up' | 'down' | 'page-up' | 'page-down'; amount?: number }
+      const parsed = args as { basedOn: { observationId: string; windowId: number }; elementId?: string; direction: 'up' | 'down' | 'page-up' | 'page-down'; amount?: number; hardware?: boolean }
       const amount = parsed.amount ?? 3
       if (!Number.isInteger(amount) || amount < 1) {
         throw new Error('scroll amount must be a positive integer')
       }
+      const hardware = assertHardwareAllowed(config, parsed.hardware)
       const outcome = await actions.perform('scroll', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, (focusFallback, backend) =>
         backend.scroll({
           windowId: parsed.basedOn.windowId,
           ...parsed.elementId !== undefined ? { elementId: parsed.elementId } : {},
           direction: parsed.direction,
           amount,
+          ...hardware ? { hardware: true } : {},
         }, focusFallback, exec.signal),
         // By elementId: the helper re-resolves it by UIA RuntimeId before
         // deciding how to scroll and fails loudly if it's gone, so the
@@ -814,10 +854,11 @@ export function keyTool(services: ToolServices) {
   return defineTool({
     name: 'key',
     description:
-      'Send a key combo (e.g. "Ctrl+S") to an observed window via posted messages. Requires `basedOn`; fails if the screen changed since. Never steals focus — apps ignoring posted input won\'t react; use click/type instead. Requires approval unless allowlisted.',
+      'Send a key combo (e.g. "Ctrl+S") to an observed window via posted messages. Requires `basedOn`; fails if the screen changed since. Never steals focus (unless hardware: true) — apps ignoring posted input won\'t react; use click/type, or hardware: true, instead. Requires approval unless allowlisted.',
     parameters: {
       ...basedOnParameters,
       keys: { type: 'string', description: 'Key combination, e.g. "Ctrl+S" or "Enter".', required: true as const },
+      ...hardwareParameter,
     },
     output: {
       schema: actionOutputSchema(false),
@@ -827,12 +868,13 @@ export function keyTool(services: ToolServices) {
     },
     timeoutMs: config.helperTimeoutMs + config.connectTimeoutMs + 15_000,
     async execute(args, exec) {
-      const parsed = args as { basedOn: { observationId: string; windowId: number }; keys: string }
+      const parsed = args as { basedOn: { observationId: string; windowId: number }; keys: string; hardware?: boolean }
       if (parsed.keys.trim() === '') {
         throw new Error('keys must not be empty')
       }
+      const hardware = assertHardwareAllowed(config, parsed.hardware)
       const outcome = await actions.perform('key', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, (focusFallback, backend) =>
-        backend.key({ windowId: parsed.basedOn.windowId, keys: parsed.keys.trim() }, focusFallback, exec.signal))
+        backend.key({ windowId: parsed.basedOn.windowId, keys: parsed.keys.trim(), ...hardware ? { hardware: true } : {} }, focusFallback, exec.signal))
       return {
         ok: true,
         windowId: outcome.windowId,
@@ -1318,7 +1360,7 @@ export function moveTool(services: ToolServices) {
   return defineTool({
     name: 'move',
     description:
-      'Move the mouse (and, with `drag`, drag) inside an observed window, via posted messages only — the real cursor never moves. Requires `basedOn`; fails if the screen changed since. Works for controls reacting to simple mouse events; not real OS drag-and-drop. Requires approval unless the window is allowlisted.',
+      'Move the mouse (and, with `drag`, drag) inside an observed window, via posted messages only — the real cursor never moves. Requires `basedOn`; fails if the screen changed since. Works for controls reacting to simple mouse events; not real OS drag-and-drop unless hardware: true. Requires approval unless the window is allowlisted.',
     parameters: {
       ...basedOnParameters,
       target: {
@@ -1342,6 +1384,7 @@ export function moveTool(services: ToolServices) {
         },
         additionalProperties: false,
       },
+      ...hardwareParameter,
     },
     output: {
       schema: actionOutputSchema(false),
@@ -1355,6 +1398,7 @@ export function moveTool(services: ToolServices) {
         basedOn: { observationId: string; windowId: number }
         target: { elementId?: string; x?: number; y?: number }
         drag?: { toX?: number; toY?: number; toElementId?: string }
+        hardware?: boolean
       }
       const target = parsed.target
       const byElement = target.elementId !== undefined
@@ -1371,11 +1415,13 @@ export function moveTool(services: ToolServices) {
         }
         drag = parsed.drag
       }
+      const hardware = assertHardwareAllowed(config, parsed.hardware)
       const outcome = await actions.perform('move', exec, parsed.basedOn.observationId, parsed.basedOn.windowId, (focusFallback, backend) =>
         backend.move({
           windowId: parsed.basedOn.windowId,
           ...byElement ? { elementId: target.elementId as string } : { x: target.x as number, y: target.y as number },
           ...drag !== undefined ? { drag } : {},
+          ...hardware ? { hardware: true } : {},
         }, focusFallback, exec.signal),
         // Same reasoning as click: elementId re-resolves by UIA RuntimeId
         // right before acting, so the whole-window tree hash adds no safety
@@ -1993,7 +2039,7 @@ export function multiActionTool(services: ToolServices) {
               properties: {
                 ok: { type: 'boolean' },
                 windowId: { type: 'integer' },
-                delivered: { type: 'string', enum: ['uia', 'posted', 'none'] as const },
+                delivered: { type: 'string', enum: ['uia', 'posted', 'hardware', 'none'] as const },
                 process: {
                   type: 'object',
                   properties: {

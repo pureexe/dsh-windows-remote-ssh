@@ -184,7 +184,7 @@ function expectPixel(value: unknown, op: string): PixelHint {
 function expectActionOutcome(value: unknown, op: string): ActionOutcome {
   const record = expectRecordValue(value, op)
   const delivered = expectString(record, 'delivered', op)
-  if (delivered !== 'uia' && delivered !== 'posted' && delivered !== 'none') {
+  if (delivered !== 'uia' && delivered !== 'posted' && delivered !== 'hardware' && delivered !== 'none') {
     throw new RemoteSshError(`helper "${op}" returned an unknown delivered mechanism`, 'BAD_HELPER_RESPONSE')
   }
   const restored = record['restored']

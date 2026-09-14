@@ -54,6 +54,17 @@
         # foreground as a fallback when posted input is unavailable.
         # 'never' (default) never steals focus; 'allow' permits the fallback.
         focusFallback: never
+        # Allow click/type/key/scroll/move to accept hardware: true and
+        # deliver via real SendInput events (the actual OS cursor moves,
+        # real keyboard/mouse hardware-level input is injected) instead of
+        # UIA/posted messages (default false). Needed for apps that ignore
+        # posted messages entirely - games, DirectX/UWP surfaces, anything
+        # reading raw input instead of the window message queue. More
+        # invasive than focusFallback: it always brings the window forward
+        # AND moves the real cursor / steals real keyboard focus. Off by
+        # default; still gated by approval like every other mutating action
+        # when enabled.
+        allowHardwareInput: false
         # How screen_shot and filesystem_pull (of an image file) render:
         # 'auto' (default) always attaches the captured/pulled image as an
         # attachment; 'text' always sends only a text description/generic
